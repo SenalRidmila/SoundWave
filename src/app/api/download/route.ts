@@ -72,8 +72,11 @@ export async function GET(request: NextRequest) {
     const stream = new ReadableStream({
       start(controller) {
         const ffmpegProcess = spawn(ffmpegBin, [
+          '-analyzeduration', '0',
+          '-fflags', 'nobuffer',
           '-i', streamUrl.trim(),
           ...config.ffmpegArgs,
+          '-flush_packets', '1',
           'pipe:1'
         ]);
 
@@ -101,6 +104,7 @@ export async function GET(request: NextRequest) {
         'Content-Type': config.mimeType,
         'Content-Disposition': `attachment; filename="${safeTitle}.${config.ext}"`,
         'Cache-Control': 'no-store',
+        'X-Accel-Buffering': 'no', // Tell Vercel/Nginx NOT to buffer this stream
         'Access-Control-Expose-Headers': 'Content-Disposition',
       },
     });
