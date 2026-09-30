@@ -17,7 +17,7 @@ const FORMAT_CONFIGS: Record<AudioFormat, FormatConfig> = {
   'mp3-128': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '128k', '-f', 'mp3'] },
   'mp3-256': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '256k', '-f', 'mp3'] },
   'mp3-320': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '320k', '-f', 'mp3'] },
-  'flac':    { ext: 'flac', mimeType: 'audio/flac',  ffmpegArgs: ['-vn', '-f', 'flac'] },
+  'flac':    { ext: 'flac', mimeType: 'audio/flac',  ffmpegArgs: ['-vn', '-compression_level', '0', '-f', 'flac'] },
   'wav':     { ext: 'wav',  mimeType: 'audio/wav',   ffmpegArgs: ['-vn', '-f', 'wav'] },
 };
 
@@ -72,6 +72,7 @@ export async function GET(request: NextRequest) {
     const stream = new ReadableStream({
       start(controller) {
         const ffmpegProcess = spawn(ffmpegBin, [
+          '-threads', '2',
           '-analyzeduration', '0',
           '-fflags', 'nobuffer',
           '-i', streamUrl.trim(),
