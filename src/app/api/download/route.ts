@@ -85,16 +85,19 @@ export async function GET(request: NextRequest) {
     if (!streamUrl) throw new Error('No stream URL returned');
 
     // Step 2: Convert or bypass FFmpeg
-    // If MP3, just return the direct stream to avoid Vercel timeouts and fake quality upscaling
+    // If MP3, stream the response directly to the user (instant start)
     if (config.ext === 'mp3') {
-      const audioRes = await axios.get(streamUrl, { responseType: 'arraybuffer' });
-      const buf = Buffer.from(audioRes.data);
+      const audioRes = await fetch(streamUrl);
       
-      return new NextResponse(buf, {
+      if (!audioRes.ok || !audioRes.body) {
+        throw new Error('Failed to fetch audio stream');
+      }
+      
+      return new NextResponse(audioRes.body, {
         headers: {
           'Content-Type': config.mimeType,
           'Content-Disposition': `attachment; filename="${safeTitle}.${config.ext}"`,
-          'Content-Length': String(buf.length),
+          'Content-Length': audioRes.headers.get('content-length') || '',
           'Cache-Control': 'no-store',
           'Access-Control-Expose-Headers': 'Content-Disposition',
         },
