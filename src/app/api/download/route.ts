@@ -1,11 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import path from 'path';
+import { spawn } from 'child_process';
 import fs from 'fs';
-import os from 'os';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 
-const execAsync = promisify(exec);
 export const dynamic = 'force-dynamic';
 export const maxDuration = 120;
 
@@ -14,15 +10,15 @@ type AudioFormat = 'mp3-128' | 'mp3-256' | 'mp3-320' | 'flac' | 'wav';
 interface FormatConfig {
   ext: string;
   mimeType: string;
-  ffmpegArgs: string;
+  ffmpegArgs: string[];
 }
 
 const FORMAT_CONFIGS: Record<AudioFormat, FormatConfig> = {
-  'mp3-128': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: '-vn -ab 128k -f mp3' },
-  'mp3-256': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: '-vn -ab 256k -f mp3' },
-  'mp3-320': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: '-vn -ab 320k -f mp3' },
-  'flac':    { ext: 'flac', mimeType: 'audio/flac',  ffmpegArgs: '-vn -f flac' },
-  'wav':     { ext: 'wav',  mimeType: 'audio/wav',   ffmpegArgs: '-vn -f wav' },
+  'mp3-128': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '128k', '-f', 'mp3'] },
+  'mp3-256': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '256k', '-f', 'mp3'] },
+  'mp3-320': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '320k', '-f', 'mp3'] },
+  'flac':    { ext: 'flac', mimeType: 'audio/flac',  ffmpegArgs: ['-vn', '-f', 'flac'] },
+  'wav':     { ext: 'wav',  mimeType: 'audio/wav',   ffmpegArgs: ['-vn', '-f', 'wav'] },
 };
 
 function sanitizeFilename(name: string): string {
@@ -44,27 +40,9 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Invalid format' }, { status: 400 });
   }
 
-  const safeTitle  = sanitizeFilename(title);
-  const cacheKey   = Buffer.from(trackUrl + format).toString('base64').replace(/[^a-z0-9]/gi, '').slice(0, 32);
-  const outputPath = path.join(os.tmpdir(), `sc_${cacheKey}.${config.ext}`);
+  const safeTitle = sanitizeFilename(title);
 
   try {
-    // Check cache (1 hour)
-    if (fs.existsSync(outputPath)) {
-      const { mtimeMs, size } = fs.statSync(outputPath);
-      if (size > 0 && Date.now() - mtimeMs < 3_600_000) {
-        const buf = fs.readFileSync(outputPath);
-        return new NextResponse(buf, {
-          headers: {
-            'Content-Type': config.mimeType,
-            'Content-Disposition': `attachment; filename="${safeTitle}.${config.ext}"`,
-            'Content-Length': String(buf.length),
-            'Access-Control-Expose-Headers': 'Content-Disposition',
-          },
-        });
-      }
-    }
-
     // Step 1: Get best audio stream URL natively using soundcloud-downloader
     const scdlModule = await import('soundcloud-downloader');
     const scdl = scdlModule.default;
@@ -84,52 +62,44 @@ export async function GET(request: NextRequest) {
     
     if (!streamUrl) throw new Error('No stream URL returned');
 
-    // Step 2: Convert or bypass FFmpeg
-    // If MP3, stream the response directly to the user (instant start)
-    if (config.ext === 'mp3') {
-      const audioRes = await fetch(streamUrl);
-      
-      if (!audioRes.ok || !audioRes.body) {
-        throw new Error('Failed to fetch audio stream');
-      }
-      
-      return new NextResponse(audioRes.body, {
-        headers: {
-          'Content-Type': config.mimeType,
-          'Content-Disposition': `attachment; filename="${safeTitle}.${config.ext}"`,
-          'Content-Length': audioRes.headers.get('content-length') || '',
-          'Cache-Control': 'no-store',
-          'Access-Control-Expose-Headers': 'Content-Disposition',
-        },
-      });
-    }
-
-    // For FLAC/WAV, use FFmpeg
+    // Step 2: Convert with FFmpeg on-the-fly and pipe directly to client
     const ffmpegInstaller = (await import('@ffmpeg-installer/ffmpeg')).default;
     const ffmpegBin = ffmpegInstaller.path;
     
     // Ensure executable permissions on Vercel
     try { fs.chmodSync(ffmpegBin, 0o755); } catch (e) {}
 
-    await execAsync(
-      `"${ffmpegBin}" -y -i "${streamUrl.trim()}" ${config.ffmpegArgs} "${outputPath}"`,
-      { timeout: 90000 }
-    );
+    const stream = new ReadableStream({
+      start(controller) {
+        const ffmpegProcess = spawn(ffmpegBin, [
+          '-i', streamUrl.trim(),
+          ...config.ffmpegArgs,
+          'pipe:1'
+        ]);
 
-    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
-      throw new Error('FFmpeg conversion produced empty file');
-    }
+        ffmpegProcess.stdout.on('data', (chunk) => {
+          controller.enqueue(new Uint8Array(chunk));
+        });
 
-    const buf = fs.readFileSync(outputPath);
+        ffmpegProcess.stdout.on('end', () => {
+          controller.close();
+        });
 
-    // Clean up after 1 min
-    setTimeout(() => { try { fs.unlinkSync(outputPath); } catch {} }, 60_000);
+        ffmpegProcess.stderr.on('data', (data) => {
+          // You can log stderr if you need to debug FFmpeg
+        });
 
-    return new NextResponse(buf, {
+        ffmpegProcess.on('error', (err) => {
+          console.error('FFmpeg error:', err);
+          controller.error(err);
+        });
+      },
+    });
+
+    return new NextResponse(stream, {
       headers: {
         'Content-Type': config.mimeType,
         'Content-Disposition': `attachment; filename="${safeTitle}.${config.ext}"`,
-        'Content-Length': String(buf.length),
         'Cache-Control': 'no-store',
         'Access-Control-Expose-Headers': 'Content-Disposition',
       },
