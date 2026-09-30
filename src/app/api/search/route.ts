@@ -97,46 +97,9 @@ export async function GET(request: NextRequest) {
   } catch (error) {
     console.error('SoundCloud search error:', error);
 
-    // Fallback: try yt-dlp if scdl fails
-    try {
-      const { exec }      = await import('child_process');
-      const { promisify } = await import('util');
-      const execAsync     = promisify(exec);
-
-      const ytdlp = (await import('yt-dlp-exec')).default;
-      const stdout = await ytdlp(`scsearch${limit}:${query}`, {
-        dumpJson: true,
-        noDownload: true,
-        noWarnings: true
-      }) as unknown as string;
-
-      const lines = stdout.trim().split('\n').filter(l => l.startsWith('{'));
-      const tracks = lines.map((line) => {
-        try {
-          const t = JSON.parse(line);
-          return {
-            id:              t.id || t.webpage_url,
-            title:           t.title || 'Unknown',
-            artist:          t.artist || t.uploader || 'Unknown Artist',
-            thumbnail:       t.thumbnail || '',
-            duration:        fmtDuration((t.duration || 0) * 1000),
-            durationSeconds: t.duration || 0,
-            likeCount:       fmtCount(t.like_count),
-            viewCount:       fmtCount(t.view_count),
-            genre:           '',
-            url:             t.webpage_url,
-          };
-        } catch { return null; }
-      }).filter(Boolean);
-
-      return NextResponse.json({ songs: tracks });
-
-    } catch (ytErr) {
-      console.error('yt-dlp fallback failed:', ytErr);
       return NextResponse.json(
         { error: 'Search failed. Check server logs.' },
         { status: 500 }
       );
-    }
   }
 }

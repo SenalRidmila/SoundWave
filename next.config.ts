@@ -11,13 +11,12 @@ const nextConfig: NextConfig = {
   },
   
   // Fix Turbopack errors with dynamic binary requires
-  serverExternalPackages: ['@ffmpeg-installer/ffmpeg', 'yt-dlp-exec'],
+  serverExternalPackages: ['@ffmpeg-installer/ffmpeg'],
   
   // Explicitly include binaries in the Vercel serverless function
   outputFileTracingIncludes: {
     '/api/**/*': [
-      './node_modules/@ffmpeg-installer/linux-x64/ffmpeg',
-      './node_modules/yt-dlp-exec/bin/yt-dlp'
+      './node_modules/@ffmpeg-installer/linux-x64/ffmpeg'
     ]
   },
 

@@ -15,13 +15,22 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    // Get best audio stream URL from SoundCloud, prioritizing direct HTTP over HLS (m3u8)
-    const ytdlp = (await import('yt-dlp-exec')).default;
-    const streamUrl = await ytdlp(trackUrl, {
-      f: 'http_mp3/bestaudio[ext=mp3]/bestaudio[protocol^=http]',
-      getUrl: true,
-      noWarnings: true
-    }) as unknown as string;
+    // Get best audio stream URL natively using soundcloud-downloader
+    const scdlModule = await import('soundcloud-downloader');
+    const scdl = scdlModule.default;
+    const axios = (await import('axios')).default;
+    
+    const clientID = await scdl.getClientID();
+    const info = await scdl.getInfo(trackUrl);
+    
+    // Find progressive stream (native MP3)
+    const progressiveFormat = info.media.transcodings.find(t => t.format.protocol === 'progressive');
+    if (!progressiveFormat) {
+      return NextResponse.json({ error: 'No progressive stream found' }, { status: 404 });
+    }
+
+    const res = await axios.get(`${progressiveFormat.url}?client_id=${clientID}`);
+    const streamUrl = res.data.url;
 
     if (!streamUrl) {
       return NextResponse.json({ error: 'Could not get stream URL' }, { status: 500 });
