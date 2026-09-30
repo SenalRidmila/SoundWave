@@ -103,7 +103,7 @@ export async function GET(request: NextRequest) {
     return new NextResponse(stream, {
       headers: {
         'Content-Type': config.mimeType,
-        'Content-Disposition': `attachment; filename="${safeTitle}.${config.ext}"`,
+        'Content-Disposition': `attachment; filename="download.${config.ext}"; filename*=UTF-8''${encodeURIComponent(safeTitle)}.${config.ext}`,
         'Cache-Control': 'no-store',
         'X-Accel-Buffering': 'no', // Tell Vercel/Nginx NOT to buffer this stream
         'Access-Control-Expose-Headers': 'Content-Disposition',
