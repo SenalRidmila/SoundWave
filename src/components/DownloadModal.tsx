@@ -60,9 +60,16 @@ export default function DownloadModal() {
       const contentDisposition = response.headers.get('Content-Disposition');
       let filename = `${fullTitle.replace(/[^a-zA-Z0-9 -]/g, '')}.${selectedFormat.split('-')[0]}`;
       if (contentDisposition) {
-        const match = contentDisposition.match(/filename="?([^"]+)"?/);
-        if (match && match[1]) {
-          filename = match[1];
+        // First try to match the UTF-8 encoded filename
+        const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+        if (utf8Match && utf8Match[1]) {
+          filename = decodeURIComponent(utf8Match[1]);
+        } else {
+          // Fallback to regular filename
+          const match = contentDisposition.match(/filename="?([^";]+)"?/i);
+          if (match && match[1]) {
+            filename = match[1];
+          }
         }
       }
 
