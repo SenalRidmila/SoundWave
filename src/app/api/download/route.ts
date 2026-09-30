@@ -66,18 +66,20 @@ export async function GET(request: NextRequest) {
     }
 
     // Step 1: Get best audio stream URL from SoundCloud via yt-dlp
-    const ytDlpPath = 'C:\\\\Users\\\\Lenovo\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\yt-dlp.exe';
-    const { stdout: urlOut } = await execAsync(
-      `"${ytDlpPath}" -f "http_mp3/bestaudio[ext=mp3]/bestaudio[protocol^=http]" --get-url --no-warnings "${trackUrl}"`,
-      { timeout: 30000 }
-    );
-    const streamUrl = urlOut.trim().split('\n')[0];
+    const ytdlp = (await import('yt-dlp-exec')).default;
+    const streamUrl = await ytdlp(trackUrl, {
+      f: 'http_mp3/bestaudio[ext=mp3]/bestaudio[protocol^=http]',
+      getUrl: true,
+      noWarnings: true
+    }) as unknown as string;
+    
     if (!streamUrl) throw new Error('No stream URL returned');
 
     // Step 2: Convert with FFmpeg
-    const ffmpegBin = 'C:\\\\ffmpeg\\\\bin\\\\ffmpeg.exe';
+    const ffmpegInstaller = (await import('@ffmpeg-installer/ffmpeg')).default;
+    const ffmpegBin = ffmpegInstaller.path;
     await execAsync(
-      `"${ffmpegBin}" -y -i "${streamUrl}" ${config.ffmpegArgs} "${outputPath}"`,
+      `"${ffmpegBin}" -y -i "${streamUrl.trim()}" ${config.ffmpegArgs} "${outputPath}"`,
       { timeout: 90000 }
     );
 

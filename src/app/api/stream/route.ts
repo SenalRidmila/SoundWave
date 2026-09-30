@@ -16,13 +16,13 @@ export async function GET(request: NextRequest) {
 
   try {
     // Get best audio stream URL from SoundCloud, prioritizing direct HTTP over HLS (m3u8)
-    const ytDlpPath = 'C:\\\\Users\\\\Lenovo\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\yt-dlp.exe';
-    const { stdout } = await execAsync(
-      `"${ytDlpPath}" -f "http_mp3/bestaudio[ext=mp3]/bestaudio[protocol^=http]" --get-url --no-warnings "${trackUrl}"`,
-      { timeout: 25000 }
-    );
+    const ytdlp = (await import('yt-dlp-exec')).default;
+    const streamUrl = await ytdlp(trackUrl, {
+      f: 'http_mp3/bestaudio[ext=mp3]/bestaudio[protocol^=http]',
+      getUrl: true,
+      noWarnings: true
+    }) as unknown as string;
 
-    const streamUrl = stdout.trim().split('\n')[0];
     if (!streamUrl) {
       return NextResponse.json({ error: 'Could not get stream URL' }, { status: 500 });
     }

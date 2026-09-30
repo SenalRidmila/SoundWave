@@ -103,11 +103,12 @@ export async function GET(request: NextRequest) {
       const { promisify } = await import('util');
       const execAsync     = promisify(exec);
 
-      const ytDlpPath = 'C:\\\\Users\\\\Lenovo\\\\AppData\\\\Local\\\\Microsoft\\\\WinGet\\\\Packages\\\\yt-dlp.yt-dlp_Microsoft.Winget.Source_8wekyb3d8bbwe\\\\yt-dlp.exe';
-      const { stdout } = await execAsync(
-        `"${ytDlpPath}" "scsearch${limit}:${query}" --dump-json --no-download --no-warnings 2>&1`,
-        { timeout: 25000 }
-      );
+      const ytdlp = (await import('yt-dlp-exec')).default;
+      const stdout = await ytdlp(`scsearch${limit}:${query}`, {
+        dumpJson: true,
+        noDownload: true,
+        noWarnings: true
+      }) as unknown as string;
 
       const lines = stdout.trim().split('\n').filter(l => l.startsWith('{'));
       const tracks = lines.map((line) => {
