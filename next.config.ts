@@ -9,24 +9,28 @@ const nextConfig: NextConfig = {
       { protocol: 'https', hostname: '**.googleusercontent.com' },
     ],
   },
+  
+  // Fix Turbopack errors with dynamic binary requires
+  serverExternalPackages: ['@ffmpeg-installer/ffmpeg', 'yt-dlp-exec'],
+  
+  // Explicitly include binaries in the Vercel serverless function
+  outputFileTracingIncludes: {
+    '/api/**/*': [
+      './node_modules/@ffmpeg-installer/linux-x64/ffmpeg',
+      './node_modules/yt-dlp-exec/bin/yt-dlp'
+    ]
+  },
+
   // Allow large response bodies for audio file downloads
   experimental: {
     serverActions: {
       bodySizeLimit: '500mb',
     },
-    outputFileTracingIncludes: {
-      '/api/**/*': [
-        './node_modules/@ffmpeg-installer/linux-x64/ffmpeg',
-        './node_modules/yt-dlp-exec/bin/yt-dlp'
-      ]
-    },
   },
+  
   typescript: {
     ignoreBuildErrors: true,
-  },
-  eslint: {
-    ignoreDuringBuilds: true,
-  },
+  }
 };
 
 export default nextConfig;
