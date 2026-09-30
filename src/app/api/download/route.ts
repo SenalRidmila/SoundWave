@@ -84,9 +84,30 @@ export async function GET(request: NextRequest) {
     
     if (!streamUrl) throw new Error('No stream URL returned');
 
-    // Step 2: Convert with FFmpeg
+    // Step 2: Convert or bypass FFmpeg
+    // If MP3, just return the direct stream to avoid Vercel timeouts and fake quality upscaling
+    if (config.ext === 'mp3') {
+      const audioRes = await axios.get(streamUrl, { responseType: 'arraybuffer' });
+      const buf = Buffer.from(audioRes.data);
+      
+      return new NextResponse(buf, {
+        headers: {
+          'Content-Type': config.mimeType,
+          'Content-Disposition': `attachment; filename="${safeTitle}.${config.ext}"`,
+          'Content-Length': String(buf.length),
+          'Cache-Control': 'no-store',
+          'Access-Control-Expose-Headers': 'Content-Disposition',
+        },
+      });
+    }
+
+    // For FLAC/WAV, use FFmpeg
     const ffmpegInstaller = (await import('@ffmpeg-installer/ffmpeg')).default;
     const ffmpegBin = ffmpegInstaller.path;
+    
+    // Ensure executable permissions on Vercel
+    try { fs.chmodSync(ffmpegBin, 0o755); } catch (e) {}
+
     await execAsync(
       `"${ffmpegBin}" -y -i "${streamUrl.trim()}" ${config.ffmpegArgs} "${outputPath}"`,
       { timeout: 90000 }
@@ -111,10 +132,10 @@ export async function GET(request: NextRequest) {
       },
     });
 
-  } catch (err) {
+  } catch (err: any) {
     console.error('Download error:', err);
     return NextResponse.json(
-      { error: 'Download failed. Ensure yt-dlp and ffmpeg are installed and in PATH.' },
+      { error: `Download failed: ${err.message || 'Server error'}` },
       { status: 500 }
     );
   }
