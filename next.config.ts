@@ -14,6 +14,12 @@ const nextConfig: NextConfig = {
     serverActions: {
       bodySizeLimit: '500mb',
     },
+    outputFileTracingIncludes: {
+      '/api/**/*': [
+        './node_modules/@ffmpeg-installer/linux-x64/ffmpeg',
+        './node_modules/yt-dlp-exec/bin/yt-dlp'
+      ]
+    },
   },
   typescript: {
     ignoreBuildErrors: true,
