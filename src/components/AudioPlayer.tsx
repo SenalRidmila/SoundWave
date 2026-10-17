@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useCallback } from 'react';
+import Hls from 'hls.js';
 import {
   Play, Pause, SkipBack, SkipForward, Volume2, VolumeX,
   Download, Repeat, Shuffle, ChevronDown, Music2,
@@ -17,6 +18,17 @@ export default function AudioPlayer() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const progressRef = useRef<HTMLDivElement>(null);
   const streamUrlRef = useRef<string>('');
+  const hlsRef = useRef<Hls | null>(null);
+
+  // Clean up Hls on unmount
+  useEffect(() => {
+    return () => {
+      if (hlsRef.current) {
+        hlsRef.current.destroy();
+        hlsRef.current = null;
+      }
+    };
+  }, []);
 
   // Load stream URL when song changes
   useEffect(() => {
@@ -29,9 +41,35 @@ export default function AudioPlayer() {
         const data = await res.json();
         if (data.streamUrl && audioRef.current) {
           streamUrlRef.current = data.streamUrl;
-          audioRef.current.src = data.streamUrl;
-          audioRef.current.load();
-          if (isPlaying) audioRef.current.play().catch(() => {});
+
+          // Destroy previous Hls instance if any
+          if (hlsRef.current) {
+            hlsRef.current.destroy();
+            hlsRef.current = null;
+          }
+
+          const isHls = data.isHls || data.streamUrl.includes('.m3u8');
+          if (isHls && Hls.isSupported()) {
+            const hls = new Hls({
+              enableWorker: true,
+              lowLatencyMode: true,
+            });
+            hls.loadSource(data.streamUrl);
+            hls.attachMedia(audioRef.current);
+            hls.on(Hls.Events.MANIFEST_PARSED, () => {
+              if (isPlaying) audioRef.current?.play().catch(() => {});
+            });
+            hls.on(Hls.Events.ERROR, (_event, errData) => {
+              if (errData.fatal) {
+                console.error('HLS error:', errData);
+              }
+            });
+            hlsRef.current = hls;
+          } else {
+            audioRef.current.src = data.streamUrl;
+            audioRef.current.load();
+            if (isPlaying) audioRef.current.play().catch(() => {});
+          }
         }
       } catch (err) {
         console.error('Stream load error:', err);

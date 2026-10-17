@@ -23,20 +23,27 @@ export async function GET(request: NextRequest) {
     const clientID = await scdl.getClientID();
     const info = await scdl.getInfo(trackUrl);
     
-    // Find progressive stream (native MP3)
-    const progressiveFormat = info.media.transcodings.find(t => t.format.protocol === 'progressive');
-    if (!progressiveFormat) {
-      return NextResponse.json({ error: 'No progressive stream found' }, { status: 404 });
+    // Find best audio stream (progressive MP3 preferred, fallback to HLS)
+    const progressiveFormat = info.media.transcodings.find((t: any) => t.format.protocol === 'progressive');
+    const hlsFormat = info.media.transcodings.find((t: any) => t.format.protocol === 'hls' && t.quality === 'sq')
+      || info.media.transcodings.find((t: any) => t.format.protocol === 'hls');
+
+    const selectedFormat = progressiveFormat || hlsFormat || info.media.transcodings[0];
+    if (!selectedFormat) {
+      return NextResponse.json({ error: 'No audio stream found for this track' }, { status: 404 });
     }
 
-    const res = await axios.get(`${progressiveFormat.url}?client_id=${clientID}`);
+    const res = await axios.get(`${selectedFormat.url}?client_id=${clientID}`);
     const streamUrl = res.data.url;
 
     if (!streamUrl) {
       return NextResponse.json({ error: 'Could not get stream URL' }, { status: 500 });
     }
 
-    return NextResponse.json({ streamUrl });
+    return NextResponse.json({ 
+      streamUrl,
+      isHls: selectedFormat.format?.protocol === 'hls' || streamUrl.includes('.m3u8')
+    });
   } catch (error) {
     console.error('Stream error:', error);
     return NextResponse.json(

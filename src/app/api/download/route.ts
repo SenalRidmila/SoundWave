@@ -51,13 +51,17 @@ export async function GET(request: NextRequest) {
     const clientID = await scdl.getClientID();
     const info = await scdl.getInfo(trackUrl);
     
-    // Find progressive stream (native MP3)
-    const progressiveFormat = info.media.transcodings.find(t => t.format.protocol === 'progressive');
-    if (!progressiveFormat) {
-      throw new Error('No progressive stream found');
+    // Find best audio stream (progressive MP3 preferred, fallback to HLS m3u8)
+    const progressiveFormat = info.media.transcodings.find((t: any) => t.format.protocol === 'progressive');
+    const hlsFormat = info.media.transcodings.find((t: any) => t.format.protocol === 'hls' && t.quality === 'sq')
+      || info.media.transcodings.find((t: any) => t.format.protocol === 'hls');
+
+    const selectedFormat = progressiveFormat || hlsFormat || info.media.transcodings[0];
+    if (!selectedFormat) {
+      throw new Error('No audio stream found for this track');
     }
 
-    const res = await axios.get(`${progressiveFormat.url}?client_id=${clientID}`);
+    const res = await axios.get(`${selectedFormat.url}?client_id=${clientID}`);
     const streamUrl = res.data.url;
     
     if (!streamUrl) throw new Error('No stream URL returned');
