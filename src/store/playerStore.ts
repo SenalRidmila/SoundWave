@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { Song, AudioFormat } from '@/types';
+import { Song } from '@/types';
 
 interface PlayerStore {
   // Playback state
@@ -22,6 +22,7 @@ interface PlayerStore {
   // Actions
   playSong: (song: Song, queue?: Song[]) => void;
   togglePlay: () => void;
+  setIsPlaying: (playing: boolean) => void;
   setCurrentTime: (time: number) => void;
   setDuration: (duration: number) => void;
   setVolume: (volume: number) => void;
@@ -54,6 +55,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       currentSong: song,
       isPlaying: true,
       currentTime: 0,
+      duration: song.durationSeconds || 0,
       queue: newQueue,
       currentIndex: index !== -1 ? index : 0,
       isLoading: true,
@@ -61,6 +63,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   },
 
   togglePlay: () => set((state) => ({ isPlaying: !state.isPlaying })),
+  setIsPlaying: (playing) => set({ isPlaying: playing }),
 
   setCurrentTime: (time) => set({ currentTime: time }),
   setDuration: (duration) => set({ duration }),
@@ -72,7 +75,14 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     const { queue, currentIndex } = get();
     if (currentIndex < queue.length - 1) {
       const nextSong = queue[currentIndex + 1];
-      set({ currentSong: nextSong, currentIndex: currentIndex + 1, isPlaying: true, currentTime: 0, isLoading: true });
+      set({
+        currentSong: nextSong,
+        currentIndex: currentIndex + 1,
+        isPlaying: true,
+        currentTime: 0,
+        duration: nextSong.durationSeconds || 0,
+        isLoading: true,
+      });
     }
   },
 
@@ -80,7 +90,14 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     const { queue, currentIndex } = get();
     if (currentIndex > 0) {
       const prevSong = queue[currentIndex - 1];
-      set({ currentSong: prevSong, currentIndex: currentIndex - 1, isPlaying: true, currentTime: 0, isLoading: true });
+      set({
+        currentSong: prevSong,
+        currentIndex: currentIndex - 1,
+        isPlaying: true,
+        currentTime: 0,
+        duration: prevSong.durationSeconds || 0,
+        isLoading: true,
+      });
     }
   },
 

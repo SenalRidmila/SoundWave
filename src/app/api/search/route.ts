@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { searchSoundCloudTracks, SCTrack } from '@/lib/soundcloud';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 30;
@@ -26,80 +27,45 @@ function getArtwork(url?: string): string {
   return url.replace('-large.', '-t500x500.').replace('-large-', '-t500x500-');
 }
 
-interface SCTrack {
-  id: number;
-  title: string;
-  user?: { username?: string; avatar_url?: string };
-  artwork_url?: string;
-  duration: number;
-  full_duration?: number;
-  permalink_url: string;
-  likes_count?: number;
-  playback_count?: number;
-  streamable?: boolean;
-  genre?: string;
-}
-
-interface SCSearchResult {
-  collection: SCTrack[];
-  total_results?: number;
-}
-
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const query = searchParams.get('q');
-  const limit = Math.min(parseInt(searchParams.get('limit') || '20'), 25);
+  const limit = Math.min(parseInt(searchParams.get('limit') || '20', 10), 25);
 
   if (!query?.trim()) {
     return NextResponse.json({ error: 'Query required' }, { status: 400 });
   }
 
   try {
-    // Dynamic import to avoid SSR issues
-    const scdlModule = await import('soundcloud-downloader');
-    const scdl = scdlModule.default;
+    const tracks = await searchSoundCloudTracks(query.trim(), limit);
 
-    // Get client_id automatically from SoundCloud website
-    const clientID = await scdl.getClientID();
-
-    // Search SoundCloud tracks
-    const result: SCSearchResult = await scdl.search({
-      query,
-      resourceType: 'tracks',
-      limit,
-    });
-
-    if (!result?.collection?.length) {
+    if (!tracks.length) {
       return NextResponse.json({ songs: [] });
     }
 
-    const songs = result.collection
-      .filter((t) => t.streamable !== false)
-      .map((t: SCTrack) => {
-        const durationMs = t.full_duration || t.duration || 0;
-        const artwork    = getArtwork(t.artwork_url || t.user?.avatar_url);
-        return {
-          id:              String(t.id),
-          title:           t.title || 'Unknown Title',
-          artist:          t.user?.username || 'Unknown Artist',
-          thumbnail:       artwork || `https://picsum.photos/seed/${t.id}/320/320`,
-          duration:        fmtDuration(durationMs),
-          durationSeconds: Math.floor(durationMs / 1000),
-          likeCount:       fmtCount(t.likes_count),
-          viewCount:       fmtCount(t.playback_count),
-          genre:           t.genre || '',
-          url:             t.permalink_url,
-        };
-      });
+    const songs = tracks.map((t: SCTrack) => {
+      const durationMs = t.full_duration || t.duration || 0;
+      const artwork    = getArtwork(t.artwork_url || t.user?.avatar_url);
+      return {
+        id:              String(t.id),
+        title:           t.title || 'Unknown Title',
+        artist:          t.user?.username || 'Unknown Artist',
+        thumbnail:       artwork || `https://picsum.photos/seed/${t.id}/320/320`,
+        duration:        fmtDuration(durationMs),
+        durationSeconds: Math.floor(durationMs / 1000),
+        likeCount:       fmtCount(t.likes_count),
+        viewCount:       fmtCount(t.playback_count),
+        genre:           t.genre || '',
+        url:             t.permalink_url,
+      };
+    });
 
     return NextResponse.json({ songs });
-
   } catch (error) {
     console.error('SoundCloud search error:', error);
-
-      return NextResponse.json(
-        { error: 'Search failed. Check server logs.' },
-        { status: 500 }
-      );
+    return NextResponse.json(
+      { error: 'Search failed. Please try again.' },
+      { status: 500 }
+    );
   }
 }

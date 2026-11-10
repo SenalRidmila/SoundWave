@@ -1,9 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { resolveStreamInfo, getHlsSegmentUrls } from '@/lib/soundcloud';
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 120;
+export const maxDuration = 60;
 
 type AudioFormat = 'mp3-128' | 'mp3-256' | 'mp3-320' | 'flac' | 'wav';
 
@@ -17,21 +20,116 @@ const FORMAT_CONFIGS: Record<AudioFormat, FormatConfig> = {
   'mp3-128': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '128k', '-f', 'mp3'] },
   'mp3-256': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '256k', '-f', 'mp3'] },
   'mp3-320': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '320k', '-f', 'mp3'] },
-  'flac':    { ext: 'flac', mimeType: 'audio/flac',  ffmpegArgs: ['-vn', '-compression_level', '0', '-f', 'flac'] },
-  'wav':     { ext: 'wav',  mimeType: 'audio/wav',   ffmpegArgs: ['-vn', '-f', 'wav'] },
+  'flac':    { ext: 'flac', mimeType: 'audio/flac', ffmpegArgs: ['-vn', '-compression_level', '0', '-f', 'flac'] },
+  'wav':     { ext: 'wav',  mimeType: 'audio/wav',  ffmpegArgs: ['-vn', '-f', 'wav'] },
 };
 
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
 function sanitizeFilename(name: string): string {
-  return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 80);
+  return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 100) || 'soundcloud-track';
+}
+
+async function fetchBufferWithRetry(url: string, retries = 2): Promise<Uint8Array> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': USER_AGENT },
+        cache: 'no-store',
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const ab = await res.arrayBuffer();
+      return new Uint8Array(ab);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('Failed to fetch audio segment');
+}
+
+async function downloadFullSourceBuffer(streamUrl: string, isHls: boolean): Promise<Buffer> {
+  if (!isHls) {
+    const bytes = await fetchBufferWithRetry(streamUrl);
+    return Buffer.from(bytes);
+  }
+
+  const segmentUrls = await getHlsSegmentUrls(streamUrl);
+  const chunks: Buffer[] = new Array(segmentUrls.length);
+  const batchSize = 12;
+
+  for (let i = 0; i < segmentUrls.length; i += batchSize) {
+    const batch = segmentUrls.slice(i, i + batchSize);
+    const results = await Promise.all(batch.map((u) => fetchBufferWithRetry(u)));
+    for (let j = 0; j < results.length; j++) {
+      chunks[i + j] = Buffer.from(results[j]);
+    }
+  }
+
+  return Buffer.concat(chunks);
+}
+
+async function convertWithFfmpeg(inputBuffer: Buffer, config: FormatConfig): Promise<Buffer> {
+  const ffmpegInstaller = (await import('@ffmpeg-installer/ffmpeg')).default;
+  const ffmpegBin = ffmpegInstaller.path;
+
+  try {
+    fs.chmodSync(ffmpegBin, 0o755);
+  } catch {
+    // Ignore on Windows or read-only FS
+  }
+
+  const tmpDir = os.tmpdir();
+  const uid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const inputPath = path.join(tmpDir, `sc-in-${uid}.tmp`);
+  const outputPath = path.join(tmpDir, `sc-out-${uid}.${config.ext}`);
+
+  try {
+    await fs.promises.writeFile(inputPath, inputBuffer);
+
+    await new Promise<void>((resolve, reject) => {
+      const proc = spawn(ffmpegBin, [
+        '-nostdin',
+        '-y',
+        '-threads', '2',
+        '-i', inputPath,
+        ...config.ffmpegArgs,
+        outputPath,
+      ]);
+
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        stderr += d.toString();
+      });
+      proc.on('error', reject);
+      proc.on('close', (code) => {
+        if (code === 0) {
+          resolve();
+        } else {
+          const detail = stderr.trim().split('\n').pop() || `exit code ${code}`;
+          reject(new Error(`FFmpeg conversion failed: ${detail}`));
+        }
+      });
+    });
+
+    return await fs.promises.readFile(outputPath);
+  } finally {
+    fs.promises.unlink(inputPath).catch(() => {});
+    fs.promises.unlink(outputPath).catch(() => {});
+  }
 }
 
 export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
-  const trackUrl  = searchParams.get('url');
-  const format    = (searchParams.get('format') || 'mp3-320') as AudioFormat;
-  const title     = searchParams.get('title') || 'soundcloud-track';
+  const trackUrl = searchParams.get('url');
+  const trackId  = searchParams.get('id');
+  const format   = (searchParams.get('format') || 'mp3-320') as AudioFormat;
+  const title    = searchParams.get('title') || 'soundcloud-track';
 
-  if (!trackUrl) {
+  if (!trackUrl && !trackId) {
     return NextResponse.json({ error: 'Track URL required' }, { status: 400 });
   }
 
@@ -41,83 +139,85 @@ export async function GET(request: NextRequest) {
   }
 
   const safeTitle = sanitizeFilename(title);
+  const responseHeaders: Record<string, string> = {
+    'Content-Type': config.mimeType,
+    'Content-Disposition': `attachment; filename="download.${config.ext}"; filename*=UTF-8''${encodeURIComponent(safeTitle)}.${config.ext}`,
+    'Cache-Control': 'no-store',
+    'X-Accel-Buffering': 'no',
+    'Access-Control-Expose-Headers': 'Content-Disposition, Content-Length',
+  };
 
   try {
-    // Step 1: Get best audio stream URL natively using soundcloud-downloader
-    const scdlModule = await import('soundcloud-downloader');
-    const scdl = scdlModule.default;
-    const axios = (await import('axios')).default;
-    
-    const clientID = await scdl.getClientID();
-    const info = await scdl.getInfo(trackUrl);
-    
-    // Find best audio stream (progressive MP3 preferred, fallback to HLS m3u8)
-    const progressiveFormat = info.media.transcodings.find((t: any) => t.format.protocol === 'progressive');
-    const hlsFormat = info.media.transcodings.find((t: any) => t.format.protocol === 'hls' && t.quality === 'sq')
-      || info.media.transcodings.find((t: any) => t.format.protocol === 'hls');
+    const resolved = await resolveStreamInfo(trackUrl, trackId);
 
-    const selectedFormat = progressiveFormat || hlsFormat || info.media.transcodings[0];
-    if (!selectedFormat) {
-      throw new Error('No audio stream found for this track');
+    // Fast path for MP3 downloads when source stream is already MP3 (zero FFmpeg delay!)
+    if (config.ext === 'mp3' && resolved.isMp3) {
+      if (!resolved.isHls) {
+        // Direct progressive MP3 stream from SoundCloud CDN
+        const upstream = await fetch(resolved.streamUrl, {
+          headers: { 'User-Agent': USER_AGENT },
+          cache: 'no-store',
+        });
+
+        if (!upstream.ok || !upstream.body) {
+          throw new Error(`Failed to fetch progressive audio (${upstream.status})`);
+        }
+
+        const contentLength = upstream.headers.get('content-length');
+        if (contentLength) {
+          responseHeaders['Content-Length'] = contentLength;
+        }
+
+        return new NextResponse(upstream.body, { headers: responseHeaders });
+      }
+
+      // Parallel-batched HLS MP3 stream
+      const segmentUrls = await getHlsSegmentUrls(resolved.streamUrl);
+      let cancelled = false;
+
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          try {
+            const batchSize = 12;
+            for (let i = 0; i < segmentUrls.length; i += batchSize) {
+              if (cancelled) break;
+              const batch = segmentUrls.slice(i, i + batchSize);
+              const buffers = await Promise.all(batch.map((u) => fetchBufferWithRetry(u)));
+              for (const buf of buffers) {
+                if (cancelled) break;
+                controller.enqueue(buf);
+              }
+            }
+            if (!cancelled) {
+              controller.close();
+            }
+          } catch (err) {
+            if (!cancelled) {
+              controller.error(err);
+            }
+          }
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+
+      return new NextResponse(stream, { headers: responseHeaders });
     }
 
-    const res = await axios.get(`${selectedFormat.url}?client_id=${clientID}`);
-    const streamUrl = res.data.url;
-    
-    if (!streamUrl) throw new Error('No stream URL returned');
+    // For FLAC, WAV, or non-MP3 sources: fetch segments in parallel in Node, then convert locally with FFmpeg
+    const sourceBuffer = await downloadFullSourceBuffer(resolved.streamUrl, resolved.isHls);
+    const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
 
-    // Step 2: Convert with FFmpeg on-the-fly and pipe directly to client
-    const ffmpegInstaller = (await import('@ffmpeg-installer/ffmpeg')).default;
-    const ffmpegBin = ffmpegInstaller.path;
-    
-    // Ensure executable permissions on Vercel
-    try { fs.chmodSync(ffmpegBin, 0o755); } catch (e) {}
-
-    const stream = new ReadableStream({
-      start(controller) {
-        const ffmpegProcess = spawn(ffmpegBin, [
-          '-threads', '2',
-          '-analyzeduration', '0',
-          '-fflags', 'nobuffer',
-          '-i', streamUrl.trim(),
-          ...config.ffmpegArgs,
-          '-flush_packets', '1',
-          'pipe:1'
-        ]);
-
-        ffmpegProcess.stdout.on('data', (chunk) => {
-          controller.enqueue(new Uint8Array(chunk));
-        });
-
-        ffmpegProcess.stdout.on('end', () => {
-          controller.close();
-        });
-
-        ffmpegProcess.stderr.on('data', (data) => {
-          // You can log stderr if you need to debug FFmpeg
-        });
-
-        ffmpegProcess.on('error', (err) => {
-          console.error('FFmpeg error:', err);
-          controller.error(err);
-        });
-      },
+    responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
+    return new NextResponse(new Uint8Array(convertedBuffer), {
+      headers: responseHeaders,
     });
-
-    return new NextResponse(stream, {
-      headers: {
-        'Content-Type': config.mimeType,
-        'Content-Disposition': `attachment; filename="download.${config.ext}"; filename*=UTF-8''${encodeURIComponent(safeTitle)}.${config.ext}`,
-        'Cache-Control': 'no-store',
-        'X-Accel-Buffering': 'no', // Tell Vercel/Nginx NOT to buffer this stream
-        'Access-Control-Expose-Headers': 'Content-Disposition',
-      },
-    });
-
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error('Download error:', err);
+    const message = err instanceof Error ? err.message : 'Server error';
     return NextResponse.json(
-      { error: `Download failed: ${err.message || 'Server error'}` },
+      { error: `Download failed: ${message}` },
       { status: 500 }
     );
   }

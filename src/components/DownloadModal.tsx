@@ -6,9 +6,9 @@ import { usePlayerStore } from '@/store/playerStore';
 import { AudioFormat, FormatOption } from '@/types';
 
 const FORMAT_OPTIONS: FormatOption[] = [
-  { id: 'mp3-320', label: 'MP3 320kbps', description: 'Best MP3 quality', quality: 'ultra', icon: '🎵' },
-  { id: 'mp3-256', label: 'MP3 256kbps', description: 'High quality MP3', quality: 'high', icon: '🎵' },
-  { id: 'mp3-128', label: 'MP3 128kbps', description: 'Standard quality', quality: 'standard', icon: '🎵' },
+  { id: 'mp3-320', label: 'MP3 320kbps', description: 'Best MP3 quality (Fast)', quality: 'ultra', icon: '🎵' },
+  { id: 'mp3-256', label: 'MP3 256kbps', description: 'High quality MP3 (Fast)', quality: 'high', icon: '🎵' },
+  { id: 'mp3-128', label: 'MP3 128kbps', description: 'Standard quality (Fast)', quality: 'standard', icon: '🎵' },
   { id: 'flac',    label: 'FLAC',       description: 'Lossless audio', quality: 'lossless', icon: '🎼' },
   { id: 'wav',     label: 'WAV',        description: 'Uncompressed lossless', quality: 'lossless', icon: '🎼' },
 ];
@@ -33,31 +33,73 @@ export default function DownloadModal() {
   const { downloadSong, isDownloadModalOpen, closeDownloadModal } = usePlayerStore();
   const [selectedFormat, setSelectedFormat] = useState<AudioFormat>('mp3-320');
   const [status, setStatus] = useState<DownloadStatus>('idle');
+  const [progressText, setProgressText] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
 
   const handleDownload = async () => {
     if (!downloadSong) return;
     setStatus('loading');
+    setProgressText('Starting...');
     setErrorMsg('');
 
     try {
       const fullTitle = `${downloadSong.artist} - ${downloadSong.title}`;
       const params = new URLSearchParams({
         url: downloadSong.url,
+        id: downloadSong.id,
         format: selectedFormat,
         title: fullTitle,
       });
-      const response = await fetch(`/api/download?${params}`);
+      const response = await fetch(`/api/download?${params.toString()}`);
 
       if (!response.ok) {
-        const err = await response.json();
-        throw new Error(err.error || 'Download failed');
+        let message = 'Download failed';
+        try {
+          const err = await response.json();
+          if (err?.error) message = err.error;
+        } catch {
+          // Ignore non-JSON error body
+        }
+        throw new Error(message);
       }
 
-      const blob = await response.blob();
+      const contentLength = Number(response.headers.get('content-length') || 0);
+      let blob: Blob;
+
+      if (response.body) {
+        const reader = response.body.getReader();
+        const chunks: BlobPart[] = [];
+        let receivedBytes = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            chunks.push(value.slice());
+            receivedBytes += value.byteLength;
+            const mb = (receivedBytes / (1024 * 1024)).toFixed(1);
+            if (contentLength > 0) {
+              const pct = Math.min(99, Math.round((receivedBytes / contentLength) * 100));
+              setProgressText(`Downloading ${pct}% (${mb} MB)...`);
+            } else {
+              setProgressText(`Downloading (${mb} MB)...`);
+            }
+          }
+        }
+
+        const mimeType = response.headers.get('content-type') || 'audio/mpeg';
+        blob = new Blob(chunks, { type: mimeType });
+      } else {
+        blob = await response.blob();
+      }
+
+      if (blob.size === 0) {
+        throw new Error('The server returned an empty audio file');
+      }
       
-      // Use the exact original track name directly (bypassing header parsing completely)
-      const ext = selectedFormat.split('-')[0];
+      const ext = selectedFormat === 'flac' || selectedFormat === 'wav'
+        ? selectedFormat
+        : 'mp3';
       const filename = `${fullTitle}.${ext}`;
 
       const url = window.URL.createObjectURL(blob);
@@ -67,7 +109,7 @@ export default function DownloadModal() {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      window.URL.revokeObjectURL(url);
+      setTimeout(() => window.URL.revokeObjectURL(url), 1000);
 
       setStatus('done');
       setTimeout(() => setStatus('idle'), 3000);
@@ -188,7 +230,7 @@ export default function DownloadModal() {
               {status === 'loading' ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Converting & Downloading...
+                  {progressText || 'Preparing Download...'}
                 </>
               ) : (
                 <>

@@ -24,6 +24,7 @@ export default function SongCard({ song, queue, index }: SongCardProps) {
 
   return (
     <div
+      onClick={handlePlay}
       className={`group relative flex items-center gap-4 px-4 py-3 rounded-xl transition-all duration-200 cursor-pointer ${
         isCurrentSong
           ? 'bg-gradient-to-r from-orange-500/15 via-red-500/10 to-transparent border border-orange-500/30'
@@ -40,7 +41,10 @@ export default function SongCard({ song, queue, index }: SongCardProps) {
           {index + 1}
         </span>
         <button
-          onClick={handlePlay}
+          onClick={(e) => {
+            e.stopPropagation();
+            handlePlay();
+          }}
           className={`absolute inset-0 flex items-center justify-center transition-all duration-200 ${
             isCurrentSong ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
           }`}
@@ -105,7 +109,7 @@ export default function SongCard({ song, queue, index }: SongCardProps) {
       <span className="text-gray-400 text-sm font-mono flex-shrink-0 hidden sm:block">{song.duration}</span>
 
       {/* Action buttons */}
-      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all duration-200 flex-shrink-0">
+      <div className="flex items-center gap-1 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-all duration-200 flex-shrink-0">
         <button
           onClick={(e) => { e.stopPropagation(); addToQueue(song); }}
           className="p-2 text-gray-400 hover:text-white hover:bg-white/10 rounded-lg transition-all"
