@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { resolveStreamInfo, getHlsSegmentUrls } from '@/lib/soundcloud';
+import { resolveYouTubeStream, downloadYouTubeAudioBuffer, isYouTubeUrl } from '@/lib/youtube';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -17,18 +18,38 @@ interface FormatConfig {
 }
 
 const FORMAT_CONFIGS: Record<AudioFormat, FormatConfig> = {
-  'mp3-128': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '128k', '-f', 'mp3'] },
-  'mp3-256': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '256k', '-f', 'mp3'] },
-  'mp3-320': { ext: 'mp3',  mimeType: 'audio/mpeg', ffmpegArgs: ['-vn', '-ab', '320k', '-f', 'mp3'] },
-  'flac':    { ext: 'flac', mimeType: 'audio/flac', ffmpegArgs: ['-vn', '-compression_level', '0', '-f', 'flac'] },
-  'wav':     { ext: 'wav',  mimeType: 'audio/wav',  ffmpegArgs: ['-vn', '-f', 'wav'] },
+  'mp3-128': {
+    ext: 'mp3',
+    mimeType: 'audio/mpeg',
+    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-compression_level', '7', '-f', 'mp3'],
+  },
+  'mp3-256': {
+    ext: 'mp3',
+    mimeType: 'audio/mpeg',
+    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '256k', '-compression_level', '7', '-f', 'mp3'],
+  },
+  'mp3-320': {
+    ext: 'mp3',
+    mimeType: 'audio/mpeg',
+    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '320k', '-compression_level', '7', '-f', 'mp3'],
+  },
+  'flac': {
+    ext: 'flac',
+    mimeType: 'audio/flac',
+    ffmpegArgs: ['-vn', '-compression_level', '0', '-f', 'flac'],
+  },
+  'wav': {
+    ext: 'wav',
+    mimeType: 'audio/wav',
+    ffmpegArgs: ['-vn', '-f', 'wav'],
+  },
 };
 
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 function sanitizeFilename(name: string): string {
-  return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 100) || 'soundcloud-track';
+  return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim().slice(0, 100) || 'music-track';
 }
 
 async function fetchBufferWithRetry(url: string, retries = 2): Promise<Uint8Array> {
@@ -51,7 +72,7 @@ async function fetchBufferWithRetry(url: string, retries = 2): Promise<Uint8Arra
   throw lastError instanceof Error ? lastError : new Error('Failed to fetch audio segment');
 }
 
-async function downloadFullSourceBuffer(streamUrl: string, isHls: boolean): Promise<Buffer> {
+async function downloadSoundCloudSourceBuffer(streamUrl: string, isHls: boolean): Promise<Buffer> {
   if (!isHls) {
     const bytes = await fetchBufferWithRetry(streamUrl);
     return Buffer.from(bytes);
@@ -84,8 +105,8 @@ async function convertWithFfmpeg(inputBuffer: Buffer, config: FormatConfig): Pro
 
   const tmpDir = os.tmpdir();
   const uid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const inputPath = path.join(tmpDir, `sc-in-${uid}.tmp`);
-  const outputPath = path.join(tmpDir, `sc-out-${uid}.${config.ext}`);
+  const inputPath = path.join(tmpDir, `sw-in-${uid}.tmp`);
+  const outputPath = path.join(tmpDir, `sw-out-${uid}.${config.ext}`);
 
   try {
     await fs.promises.writeFile(inputPath, inputBuffer);
@@ -126,11 +147,12 @@ export async function GET(request: NextRequest) {
   const { searchParams } = request.nextUrl;
   const trackUrl = searchParams.get('url');
   const trackId  = searchParams.get('id');
+  const source   = searchParams.get('source');
   const format   = (searchParams.get('format') || 'mp3-320') as AudioFormat;
-  const title    = searchParams.get('title') || 'soundcloud-track';
+  const title    = searchParams.get('title') || 'music-track';
 
   if (!trackUrl && !trackId) {
-    return NextResponse.json({ error: 'Track URL required' }, { status: 400 });
+    return NextResponse.json({ error: 'Track URL or ID required' }, { status: 400 });
   }
 
   const config = FORMAT_CONFIGS[format];
@@ -147,13 +169,28 @@ export async function GET(request: NextRequest) {
     'Access-Control-Expose-Headers': 'Content-Disposition, Content-Length',
   };
 
+  const isYouTube =
+    source === 'youtube' || (trackUrl ? isYouTubeUrl(trackUrl) : false);
+
   try {
+    // ── YouTube Download Path ──
+    if (isYouTube) {
+      const ytResolved = await resolveYouTubeStream(trackUrl, trackId);
+      const sourceBuffer = await downloadYouTubeAudioBuffer(ytResolved);
+      const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
+
+      responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
+      return new NextResponse(new Uint8Array(convertedBuffer), {
+        headers: responseHeaders,
+      });
+    }
+
+    // ── SoundCloud Download Path ──
     const resolved = await resolveStreamInfo(trackUrl, trackId);
 
-    // Fast path for MP3 downloads when source stream is already MP3 (zero FFmpeg delay!)
-    if (config.ext === 'mp3' && resolved.isMp3) {
+    // Direct zero-FFmpeg fast path when user requests standard 128kbps MP3 and source is already 128kbps MP3
+    if (format === 'mp3-128' && resolved.isMp3) {
       if (!resolved.isHls) {
-        // Direct progressive MP3 stream from SoundCloud CDN
         const upstream = await fetch(resolved.streamUrl, {
           headers: { 'User-Agent': USER_AGENT },
           cache: 'no-store',
@@ -171,7 +208,6 @@ export async function GET(request: NextRequest) {
         return new NextResponse(upstream.body, { headers: responseHeaders });
       }
 
-      // Parallel-batched HLS MP3 stream
       const segmentUrls = await getHlsSegmentUrls(resolved.streamUrl);
       let cancelled = false;
 
@@ -205,14 +241,25 @@ export async function GET(request: NextRequest) {
       return new NextResponse(stream, { headers: responseHeaders });
     }
 
-    // For FLAC, WAV, or non-MP3 sources: fetch segments in parallel in Node, then convert locally with FFmpeg
-    const sourceBuffer = await downloadFullSourceBuffer(resolved.streamUrl, resolved.isHls);
-    const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
-
-    responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
-    return new NextResponse(new Uint8Array(convertedBuffer), {
-      headers: responseHeaders,
-    });
+    // For MP3-320, MP3-256, FLAC, WAV: parallel download in Node, then fast local FFmpeg conversion
+    const sourceBuffer = await downloadSoundCloudSourceBuffer(resolved.streamUrl, resolved.isHls);
+    try {
+      const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
+      responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
+      return new NextResponse(new Uint8Array(convertedBuffer), {
+        headers: responseHeaders,
+      });
+    } catch (ffmpegErr) {
+      // If MP3 conversion failed on serverless, fallback to native MP3 buffer so download still succeeds
+      if (config.ext === 'mp3' && resolved.isMp3) {
+        console.warn('FFmpeg fallback to native MP3 buffer:', ffmpegErr);
+        responseHeaders['Content-Length'] = String(sourceBuffer.byteLength);
+        return new NextResponse(new Uint8Array(sourceBuffer), {
+          headers: responseHeaders,
+        });
+      }
+      throw ffmpegErr;
+    }
   } catch (err: unknown) {
     console.error('Download error:', err);
     const message = err instanceof Error ? err.message : 'Server error';

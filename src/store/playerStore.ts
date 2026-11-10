@@ -1,7 +1,10 @@
 import { create } from 'zustand';
-import { Song } from '@/types';
+import { Song, MusicSource } from '@/types';
 
 interface PlayerStore {
+  // Platform source ('soundcloud' | 'youtube')
+  activeSource: MusicSource;
+
   // Playback state
   currentSong: Song | null;
   isPlaying: boolean;
@@ -20,6 +23,7 @@ interface PlayerStore {
   isDownloadModalOpen: boolean;
   
   // Actions
+  setActiveSource: (source: MusicSource) => void;
   playSong: (song: Song, queue?: Song[]) => void;
   togglePlay: () => void;
   setIsPlaying: (playing: boolean) => void;
@@ -36,6 +40,7 @@ interface PlayerStore {
 }
 
 export const usePlayerStore = create<PlayerStore>((set, get) => ({
+  activeSource: 'soundcloud',
   currentSong: null,
   isPlaying: false,
   currentTime: 0,
@@ -47,6 +52,8 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   currentIndex: -1,
   downloadSong: null,
   isDownloadModalOpen: false,
+
+  setActiveSource: (source) => set({ activeSource: source }),
 
   playSong: (song, queue) => {
     const newQueue = queue || [song];

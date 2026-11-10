@@ -1,3 +1,5 @@
+export type MusicSource = 'soundcloud' | 'youtube';
+
 export interface Song {
   id: string;
   title: string;
@@ -7,8 +9,11 @@ export interface Song {
   durationSeconds: number;
   viewCount?: string;
   likeCount?: string;
-  /** SoundCloud track URL — used for streaming & downloading */
+  genre?: string;
+  /** Track URL — SoundCloud permalink or YouTube watch URL */
   url: string;
+  /** Platform source ('soundcloud' | 'youtube') */
+  source?: MusicSource;
 }
 
 export interface SearchResult {
@@ -23,6 +28,7 @@ export interface FormatOption {
   description: string;
   quality: 'standard' | 'high' | 'ultra' | 'lossless';
   icon: string;
+  kbps?: number;
 }
 
 export interface PlayerState {
