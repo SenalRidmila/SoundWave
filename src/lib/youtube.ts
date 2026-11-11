@@ -1,13 +1,14 @@
 import { Song } from '@/types';
+import { searchSoundCloudTracks, resolveStreamInfo, ResolvedStream } from './soundcloud';
 
 const WEB_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-const ANDROID_VR_UA =
-  'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
-
 const IOS_UA =
   'com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)';
+
+const ANDROID_VR_UA =
+  'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
 
 export interface ResolvedYouTubeStream {
   streamUrl: string;
@@ -19,12 +20,15 @@ export interface ResolvedYouTubeStream {
 
 interface GlobalYTCache {
   ytStreamCache?: Map<string, { resolved: ResolvedYouTubeStream; expiresAt: number }>;
+  ytMetaCache?: Map<string, { title: string; expiresAt: number }>;
 }
 
 const g = globalThis as unknown as GlobalYTCache;
 if (!g.ytStreamCache) g.ytStreamCache = new Map();
+if (!g.ytMetaCache) g.ytMetaCache = new Map();
 
 const STREAM_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const META_CACHE_TTL_MS = 30 * 60 * 1000;  // 30 minutes
 
 export function extractYouTubeId(input: string): string | null {
   const trimmed = input.trim();
@@ -74,17 +78,6 @@ function parseDurationToSeconds(durationStr: string): number {
     return parts[0] * 60 + parts[1];
   }
   return parts[0] || 0;
-}
-
-function formatSeconds(sec: number): string {
-  const s = Math.max(0, Math.floor(sec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const rem = s % 60;
-  if (h > 0) {
-    return `${h}:${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
-  }
-  return `${m}:${String(rem).padStart(2, '0')}`;
 }
 
 function formatViewCount(raw?: string): string {
@@ -137,7 +130,6 @@ export async function searchYouTubeTracks(query: string, limit = 20): Promise<So
         v?.lengthText?.runs?.[0]?.text ||
         '';
 
-      // Skip live streams without duration
       if (!durationText) continue;
 
       const durationSeconds = parseDurationToSeconds(durationText);
@@ -163,6 +155,13 @@ export async function searchYouTubeTracks(query: string, limit = 20): Promise<So
       const videoId: string = v.videoId;
       const thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
+      if (g.ytMetaCache) {
+        g.ytMetaCache.set(videoId, {
+          title: `${artist} - ${title}`,
+          expiresAt: Date.now() + META_CACHE_TTL_MS,
+        });
+      }
+
       songs.push({
         id: videoId,
         title,
@@ -183,6 +182,34 @@ export async function searchYouTubeTracks(query: string, limit = 20): Promise<So
   return songs;
 }
 
+export async function fetchYouTubeTitle(videoId: string): Promise<string | null> {
+  const cached = g.ytMetaCache?.get(videoId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.title;
+  }
+
+  try {
+    const u = new URL('https://www.youtube.com/oembed');
+    u.searchParams.set('url', `https://www.youtube.com/watch?v=${videoId}`);
+    u.searchParams.set('format', 'json');
+    const res = await fetch(u.toString(), {
+      headers: { 'User-Agent': WEB_USER_AGENT },
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { title?: string; author_name?: string };
+    if (!data?.title) return null;
+    const cleanAuthor = (data.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
+    const full = cleanAuthor && !data.title.toLowerCase().includes(cleanAuthor.toLowerCase())
+      ? `${cleanAuthor} - ${data.title}`
+      : data.title;
+    g.ytMetaCache?.set(videoId, { title: full, expiresAt: Date.now() + META_CACHE_TTL_MS });
+    return full;
+  } catch {
+    return null;
+  }
+}
+
 interface InnerTubeFormat {
   itag?: number;
   url?: string;
@@ -199,7 +226,6 @@ function pickBestAudioFormat(formats: InnerTubeFormat[]): InnerTubeFormat | null
   );
   if (!audioFormats.length) return null;
 
-  // Prefer audio/mp4 (itag 140) or highest bitrate audio
   audioFormats.sort((a, b) => {
     const aIsM4a = a.mimeType?.includes('mp4') ? 1 : 0;
     const bIsM4a = b.mimeType?.includes('mp4') ? 1 : 0;
@@ -220,18 +246,16 @@ async function tryInnerTubeClient(
   }
 ): Promise<ResolvedYouTubeStream | null> {
   try {
+    // Do NOT send Origin or mismatched X-YouTube-Client-Name headers for native IOS/Android clients
     const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
       method: 'POST',
       headers: {
         'User-Agent': clientConfig.userAgent,
         'Content-Type': 'application/json',
-        'X-YouTube-Client-Name': clientConfig.clientName === 'IOS' ? '5' : '28',
-        'X-YouTube-Client-Version': clientConfig.clientVersion,
-        Origin: 'https://www.youtube.com',
       },
       body: JSON.stringify({
         videoId,
-        ContentCheckOk: true,
+        contentCheckOk: true,
         racyCheckOk: true,
         context: {
           client: {
@@ -258,7 +282,6 @@ async function tryInnerTubeClient(
     const best = pickBestAudioFormat([...adaptive, ...standard]);
 
     if (best?.url) {
-      // Verify the stream URL doesn't return 403 on this IP
       const probe = await fetch(best.url, {
         headers: {
           'User-Agent': clientConfig.userAgent,
@@ -277,120 +300,7 @@ async function tryInnerTubeClient(
       }
     }
 
-    // Check hlsManifestUrl if no adaptive audio format had direct URL
-    if (data?.streamingData?.hlsManifestUrl) {
-      return {
-        streamUrl: data.streamingData.hlsManifestUrl,
-        mimeType: 'application/vnd.apple.mpegurl',
-        userAgent: clientConfig.userAgent,
-        isHls: true,
-      };
-    }
-
     return null;
-  } catch {
-    return null;
-  }
-}
-
-async function tryPipedInstances(videoId: string): Promise<ResolvedYouTubeStream | null> {
-  const instances = [
-    'https://pipedapi.kavin.rocks',
-    'https://api.piped.private.coffee',
-    'https://pipedapi.tokhmi.xyz',
-    'https://pipedapi-libre.kavin.rocks',
-  ];
-
-  const controllers = instances.map(() => new AbortController());
-
-  try {
-    const result = await Promise.any(
-      instances.map(async (base, idx) => {
-        const timeout = setTimeout(() => controllers[idx].abort(), 6000);
-        try {
-          const res = await fetch(`${base}/streams/${videoId}`, {
-            headers: { 'User-Agent': WEB_USER_AGENT, Accept: 'application/json' },
-            signal: controllers[idx].signal,
-            cache: 'no-store',
-          });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const data = await res.json();
-          const streams: Array<{
-            url?: string;
-            mimeType?: string;
-            bitrate?: number;
-            contentLength?: number;
-          }> = data?.audioStreams || [];
-
-          if (!streams.length) throw new Error('No audioStreams');
-          streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-          const best = streams[0];
-          if (!best?.url) throw new Error('Missing URL');
-
-          return {
-            streamUrl: best.url,
-            mimeType: best.mimeType?.split(';')[0] || 'audio/mp4',
-            userAgent: WEB_USER_AGENT,
-            contentLength: best.contentLength && best.contentLength > 0 ? best.contentLength : undefined,
-            isHls: false,
-          } satisfies ResolvedYouTubeStream;
-        } finally {
-          clearTimeout(timeout);
-        }
-      })
-    );
-
-    controllers.forEach((c) => c.abort());
-    return result;
-  } catch {
-    return null;
-  }
-}
-
-async function tryInvidiousInstances(videoId: string): Promise<ResolvedYouTubeStream | null> {
-  const instances = [
-    'https://inv.nadeko.net',
-    'https://invidious.nerdvpn.de',
-    'https://yewtu.be',
-  ];
-
-  const controllers = instances.map(() => new AbortController());
-
-  try {
-    const result = await Promise.any(
-      instances.map(async (base, idx) => {
-        const timeout = setTimeout(() => controllers[idx].abort(), 6000);
-        try {
-          const res = await fetch(`${base}/api/v1/videos/${videoId}?local=true`, {
-            headers: { 'User-Agent': WEB_USER_AGENT, Accept: 'application/json' },
-            signal: controllers[idx].signal,
-            cache: 'no-store',
-          });
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const data = await res.json();
-          const formats: InnerTubeFormat[] = data?.adaptiveFormats || [];
-          const best = pickBestAudioFormat(formats);
-          if (!best?.url) throw new Error('No audio format');
-
-          const finalUrl = best.url.startsWith('http')
-            ? best.url
-            : new URL(best.url, base).toString();
-
-          return {
-            streamUrl: finalUrl,
-            mimeType: best.mimeType?.split(';')[0] || 'audio/mp4',
-            userAgent: WEB_USER_AGENT,
-            contentLength: best.contentLength ? parseInt(best.contentLength, 10) : undefined,
-            isHls: false,
-          } satisfies ResolvedYouTubeStream;
-        } finally {
-          clearTimeout(timeout);
-        }
-      })
-    );
-
-    controllers.forEach((c) => c.abort());
-    return result;
   } catch {
     return null;
   }
@@ -414,47 +324,37 @@ export async function resolveYouTubeStream(
     return cached.resolved;
   }
 
-  // 1. Try ANDROID_VR InnerTube client (fast, works without signature deciphering)
+  // 1. Try IOS InnerTube client (works directly without signature deciphering)
   let resolved = await tryInnerTubeClient(videoId, {
-    clientName: 'ANDROID_VR',
-    clientVersion: '1.60.19',
-    userAgent: ANDROID_VR_UA,
+    clientName: 'IOS',
+    clientVersion: '20.03.02',
+    userAgent: IOS_UA,
     extraClientFields: {
-      androidSdkVersion: 32,
-      osName: 'Android',
-      osVersion: '12L',
-      deviceMake: 'Oculus',
-      deviceModel: 'Quest 2',
+      deviceMake: 'Apple',
+      deviceModel: 'iPhone16,2',
+      osName: 'iPhone',
+      osVersion: '18.2.1.22C161',
     },
   });
 
-  // 2. Try IOS InnerTube client
+  // 2. Try ANDROID_VR InnerTube client
   if (!resolved) {
     resolved = await tryInnerTubeClient(videoId, {
-      clientName: 'IOS',
-      clientVersion: '20.03.02',
-      userAgent: IOS_UA,
+      clientName: 'ANDROID_VR',
+      clientVersion: '1.60.19',
+      userAgent: ANDROID_VR_UA,
       extraClientFields: {
-        deviceMake: 'Apple',
-        deviceModel: 'iPhone16,2',
-        osName: 'iPhone',
-        osVersion: '18.2.1.22C161',
+        androidSdkVersion: 32,
+        osName: 'Android',
+        osVersion: '12L',
+        deviceMake: 'Oculus',
+        deviceModel: 'Quest 2',
       },
     });
   }
 
-  // 3. Try Piped instances in parallel (great fallback on datacenter IPs)
   if (!resolved) {
-    resolved = await tryPipedInstances(videoId);
-  }
-
-  // 4. Try Invidious instances in parallel
-  if (!resolved) {
-    resolved = await tryInvidiousInstances(videoId);
-  }
-
-  if (!resolved) {
-    throw new Error('Could not resolve YouTube audio stream for this video');
+    throw new Error('Direct YouTube stream blocked on this server IP');
   }
 
   if (g.ytStreamCache) {
@@ -468,12 +368,51 @@ export async function resolveYouTubeStream(
   return resolved;
 }
 
+/**
+ * Resolves a matching SoundCloud CDN stream when YouTube blocks datacenter IPs (e.g. on Vercel).
+ */
+export async function resolveYouTubeFallbackViaSoundCloud(
+  trackUrl?: string | null,
+  trackId?: string | null,
+  fallbackTitle?: string | null
+): Promise<ResolvedStream> {
+  const videoId =
+    (trackId && extractYouTubeId(trackId)) ||
+    (trackUrl && extractYouTubeId(trackUrl));
+
+  let searchQuery = fallbackTitle?.trim() || '';
+  if (!searchQuery && videoId) {
+    searchQuery = (await fetchYouTubeTitle(videoId)) || '';
+  }
+
+  // Clean common YouTube title noise like "(Official Video)", "[Lyrics]", etc.
+  const cleanedQuery = searchQuery
+    .replace(/\(official\s*(music\s*)?video\)/gi, '')
+    .replace(/\[official\s*(music\s*)?video\]/gi, '')
+    .replace(/\(official\s*audio\)/gi, '')
+    .replace(/\(lyrics?\s*(video)?\)/gi, '')
+    .replace(/\[lyrics?\s*(video)?\]/gi, '')
+    .replace(/\b(4K|HD|HQ)\b/gi, '')
+    .trim();
+
+  const queryToUse = cleanedQuery || searchQuery;
+  if (!queryToUse) {
+    throw new Error('Could not resolve YouTube audio stream for this video');
+  }
+
+  const scTracks = await searchSoundCloudTracks(queryToUse, 5);
+  if (!scTracks.length) {
+    throw new Error('Could not resolve YouTube audio stream for this video');
+  }
+
+  return await resolveStreamInfo(scTracks[0].permalink_url, String(scTracks[0].id));
+}
+
 export async function downloadYouTubeAudioBuffer(resolved: ResolvedYouTubeStream): Promise<Buffer> {
   const totalLen = resolved.contentLength || 0;
 
-  // Fetch in 4MB ranged chunks in parallel if contentLength is known (avoids YouTube throttling!)
   if (totalLen > 1024 * 1024 && !resolved.isHls) {
-    const chunkSize = 4 * 1024 * 1024; // 4 MB chunks
+    const chunkSize = 4 * 1024 * 1024;
     const ranges: Array<{ start: number; end: number }> = [];
     for (let start = 0; start < totalLen; start += chunkSize) {
       const end = Math.min(start + chunkSize - 1, totalLen - 1);

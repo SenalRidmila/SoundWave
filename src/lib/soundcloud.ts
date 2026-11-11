@@ -71,7 +71,6 @@ function normalizeTrackUrl(rawUrl: string): string {
       parsed.hostname = 'soundcloud.com';
     }
     parsed.hash = '';
-    // Keep secret_token if present for private tracks, strip tracking params
     const secretToken = parsed.searchParams.get('secret_token');
     parsed.search = '';
     if (secretToken) {
@@ -87,7 +86,6 @@ export function cacheTrack(track: SCTrack): void {
   if (!track || !g.trackCache) return;
   const expiresAt = Date.now() + TRACK_CACHE_TTL_MS;
 
-  // Prune if cache grows large
   if (g.trackCache.size > 500) {
     const now = Date.now();
     for (const [k, v] of g.trackCache.entries()) {
@@ -155,7 +153,6 @@ async function scrapeClientId(): Promise<string> {
     throw new Error('Could not find SoundCloud asset scripts');
   }
 
-  // Check script bundles from last to first in parallel batches of 4
   const candidates = [...scriptUrls].reverse();
   const keyRegex = /(?:client_id|clientId)\s*[:=]\s*["']([a-zA-Z0-9]{32})["']/;
 
@@ -258,11 +255,16 @@ export async function searchSoundCloudTracks(query: string, limit = 20): Promise
   return tracks;
 }
 
-export async function getTrackInfo(trackUrl?: string | null, trackId?: string | null): Promise<SCTrack> {
-  const cached = getCachedTrack(trackUrl, trackId);
-  if (cached) return cached;
+export async function getTrackInfo(
+  trackUrl?: string | null,
+  trackId?: string | null,
+  skipCache = false
+): Promise<SCTrack> {
+  if (!skipCache) {
+    const cached = getCachedTrack(trackUrl, trackId);
+    if (cached) return cached;
+  }
 
-  // Try fetching by numeric track ID first if available (faster & avoids URL slug issues)
   if (trackId && /^\d+$/.test(trackId.trim())) {
     try {
       const track = await scApiFetch<SCTrack>((clientId) => {
@@ -285,7 +287,6 @@ export async function getTrackInfo(trackUrl?: string | null, trackId?: string | 
 
   const cleanUrl = normalizeTrackUrl(trackUrl);
 
-  // Handle personalized track URL format if passed
   if (cleanUrl.includes('personalized-tracks::')) {
     const parts = cleanUrl.split(':');
     const extractedId = parts[parts.length - 1];
@@ -315,29 +316,71 @@ export async function getTrackInfo(trackUrl?: string | null, trackId?: string | 
   return track;
 }
 
-function selectBestTranscoding(transcodings: SCTranscoding[], preferProgressive = true): SCTranscoding | null {
-  if (!transcodings?.length) return null;
+function isRealMp3Mime(mime: string): boolean {
+  const m = mime.toLowerCase();
+  // Exclude 'audio/mpegurl' (which is SoundCloud's deprecated abr_sq HLS playlist that returns 404)
+  if (m.includes('mpegurl')) return false;
+  return m.includes('audio/mpeg') || m.includes('mp3');
+}
 
-  // Prefer full tracks over 30s snipped previews when available
-  const nonSnipped = transcodings.filter((t) => !t.snipped);
-  const pool = nonSnipped.length > 0 ? nonSnipped : transcodings;
+function rankTranscodings(transcodings: SCTranscoding[]): SCTranscoding[] {
+  if (!transcodings?.length) return [];
 
-  const isMp3 = (t: SCTranscoding) => {
+  const nonSnipped = transcodings.filter((t) => !t.snipped && t.url);
+  const pool = nonSnipped.length > 0 ? nonSnipped : transcodings.filter((t) => t.url);
+
+  const score = (t: SCTranscoding): number => {
     const mime = (t.format?.mime_type || '').toLowerCase();
-    return mime.includes('audio/mpeg') || mime.includes('mp3');
+    const proto = (t.format?.protocol || '').toLowerCase();
+    const preset = (t.preset || '').toLowerCase();
+
+    // Put deprecated abr_sq / audio/mpegurl last (usually returns 404 on SoundCloud)
+    if (mime.includes('mpegurl') || preset === 'abr_sq') return 1;
+
+    if (proto === 'progressive' && isRealMp3Mime(mime)) return 100;
+    if (proto === 'hls' && isRealMp3Mime(mime) && t.quality === 'sq') return 90;
+    if (proto === 'hls' && isRealMp3Mime(mime)) return 85;
+    if (proto === 'hls' && preset.includes('160k')) return 80;
+    if (proto === 'hls' && mime.includes('mp4') && t.quality === 'sq') return 75;
+    if (proto === 'hls' && mime.includes('mp4')) return 70;
+    if (proto === 'progressive') return 60;
+    if (proto === 'hls') return 50;
+    return 10;
   };
 
-  const progressiveMp3 = pool.find((t) => t.format?.protocol === 'progressive' && isMp3(t));
-  const hlsMp3 =
-    pool.find((t) => t.format?.protocol === 'hls' && isMp3(t) && t.quality === 'sq') ||
-    pool.find((t) => t.format?.protocol === 'hls' && isMp3(t));
-  const anyProgressive = pool.find((t) => t.format?.protocol === 'progressive');
-  const anyHls = pool.find((t) => t.format?.protocol === 'hls');
+  return [...pool].sort((a, b) => score(b) - score(a));
+}
 
-  if (preferProgressive) {
-    return progressiveMp3 || hlsMp3 || anyProgressive || anyHls || pool[0];
+async function tryResolveFromTrack(info: SCTrack): Promise<ResolvedStream | null> {
+  const ranked = rankTranscodings(info.media?.transcodings || []);
+  for (const candidate of ranked) {
+    try {
+      const data = await scApiFetch<{ url?: string }>((clientId) => {
+        const mediaUrl = new URL(candidate.url);
+        mediaUrl.searchParams.set('client_id', clientId);
+        if (info.track_authorization) {
+          mediaUrl.searchParams.set('track_authorization', info.track_authorization);
+        }
+        return mediaUrl.toString();
+      });
+
+      if (data?.url) {
+        const mimeType = candidate.format?.mime_type || 'audio/mp4';
+        const isHls = candidate.format?.protocol === 'hls' || data.url.includes('.m3u8');
+        const isMp3 = isRealMp3Mime(mimeType);
+        return {
+          streamUrl: data.url,
+          protocol: isHls ? 'hls' : 'progressive',
+          mimeType,
+          isHls,
+          isMp3,
+        };
+      }
+    } catch {
+      // Try next transcoding candidate
+    }
   }
-  return hlsMp3 || progressiveMp3 || anyHls || anyProgressive || pool[0];
+  return null;
 }
 
 export async function resolveStreamInfo(
@@ -351,38 +394,18 @@ export async function resolveStreamInfo(
     return cachedStream.resolved;
   }
 
-  const info = await getTrackInfo(trackUrl, trackId);
-  const transcodings = info.media?.transcodings || [];
-  const selected = selectBestTranscoding(transcodings, true);
+  let info = await getTrackInfo(trackUrl, trackId, false);
+  let resolved = await tryResolveFromTrack(info);
 
-  if (!selected?.url) {
-    throw new Error('No audio transcoding available for this track');
+  // If cached track transcodings expired, re-fetch fresh track info from SoundCloud API
+  if (!resolved) {
+    info = await getTrackInfo(trackUrl, trackId, true);
+    resolved = await tryResolveFromTrack(info);
   }
 
-  const data = await scApiFetch<{ url?: string }>((clientId) => {
-    const mediaUrl = new URL(selected.url);
-    mediaUrl.searchParams.set('client_id', clientId);
-    if (info.track_authorization) {
-      mediaUrl.searchParams.set('track_authorization', info.track_authorization);
-    }
-    return mediaUrl.toString();
-  });
-
-  if (!data?.url) {
-    throw new Error('SoundCloud did not return a stream URL');
+  if (!resolved) {
+    throw new Error('Could not resolve a playable SoundCloud stream for this track');
   }
-
-  const mimeType = selected.format?.mime_type || 'audio/mpeg';
-  const isHls = selected.format?.protocol === 'hls' || data.url.includes('.m3u8');
-  const isMp3 = mimeType.toLowerCase().includes('mpeg') || mimeType.toLowerCase().includes('mp3');
-
-  const resolved: ResolvedStream = {
-    streamUrl: data.url,
-    protocol: isHls ? 'hls' : 'progressive',
-    mimeType,
-    isHls,
-    isMp3,
-  };
 
   if (g.streamCache) {
     if (g.streamCache.size > 300) g.streamCache.clear();
@@ -431,4 +454,3 @@ export async function getHlsSegmentUrls(m3u8Url: string): Promise<string[]> {
 
   return urls;
 }
-

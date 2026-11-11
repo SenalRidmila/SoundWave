@@ -34,7 +34,7 @@ export default function AudioPlayer() {
     };
   }, [destroyHls]);
 
-  const playDirectFallback = useCallback((songUrl: string, songId: string, songSource = 'soundcloud') => {
+  const playDirectFallback = useCallback((songUrl: string, songId: string, songSource = 'soundcloud', songTitle = '') => {
     if (!audioRef.current || fallbackAttemptedRef.current) {
       setLoading(false);
       return;
@@ -46,6 +46,7 @@ export default function AudioPlayer() {
       url: songUrl,
       id: songId,
       source: songSource,
+      title: songTitle,
       format: 'mp3-128',
     });
     const fallbackUrl = `/api/download?${params.toString()}`;
@@ -77,11 +78,13 @@ export default function AudioPlayer() {
         audioRef.current.load();
       }
 
+      const fullTitle = `${currentSong.artist} - ${currentSong.title}`;
       try {
         const params = new URLSearchParams({
           url: currentSong.url,
           id: currentSong.id,
           source: songSource,
+          title: fullTitle,
         });
         const res = await fetch(`/api/stream?${params.toString()}`);
         const data = await res.json();
@@ -89,7 +92,7 @@ export default function AudioPlayer() {
         if (cancelled || !audioRef.current) return;
 
         if (!res.ok || !data.streamUrl) {
-          playDirectFallback(currentSong.url, currentSong.id, songSource);
+          playDirectFallback(currentSong.url, currentSong.id, songSource, fullTitle);
           return;
         }
 
@@ -116,7 +119,7 @@ export default function AudioPlayer() {
             if (cancelled) return;
             if (errData.fatal) {
               console.warn('HLS fatal error, switching to direct stream fallback:', errData.type, errData.details);
-              playDirectFallback(currentSong.url, currentSong.id, songSource);
+              playDirectFallback(currentSong.url, currentSong.id, songSource, fullTitle);
             }
           });
         } else {
@@ -130,7 +133,7 @@ export default function AudioPlayer() {
       } catch (err) {
         if (!cancelled) {
           console.error('Stream load error:', err);
-          playDirectFallback(currentSong.url, currentSong.id, songSource);
+          playDirectFallback(currentSong.url, currentSong.id, songSource, fullTitle);
         }
       }
     };
@@ -183,7 +186,12 @@ export default function AudioPlayer() {
 
   const handleAudioError = useCallback(() => {
     if (currentSong && !fallbackAttemptedRef.current) {
-      playDirectFallback(currentSong.url, currentSong.id, currentSong.source || 'soundcloud');
+      playDirectFallback(
+        currentSong.url,
+        currentSong.id,
+        currentSong.source || 'soundcloud',
+        `${currentSong.artist} - ${currentSong.title}`
+      );
     } else {
       setLoading(false);
     }

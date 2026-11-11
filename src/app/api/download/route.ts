@@ -4,7 +4,12 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { resolveStreamInfo, getHlsSegmentUrls } from '@/lib/soundcloud';
-import { resolveYouTubeStream, downloadYouTubeAudioBuffer, isYouTubeUrl } from '@/lib/youtube';
+import {
+  resolveYouTubeStream,
+  resolveYouTubeFallbackViaSoundCloud,
+  downloadYouTubeAudioBuffer,
+  isYouTubeUrl,
+} from '@/lib/youtube';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
@@ -175,10 +180,24 @@ export async function GET(request: NextRequest) {
   try {
     // ── YouTube Download Path ──
     if (isYouTube) {
-      const ytResolved = await resolveYouTubeStream(trackUrl, trackId);
-      const sourceBuffer = await downloadYouTubeAudioBuffer(ytResolved);
-      const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
+      let sourceBuffer: Buffer;
+      try {
+        const ytResolved = await resolveYouTubeStream(trackUrl, trackId);
+        sourceBuffer = await downloadYouTubeAudioBuffer(ytResolved);
+      } catch {
+        // Datacenter/Vercel IP fallback via SoundCloud CDN
+        const fallbackResolved = await resolveYouTubeFallbackViaSoundCloud(
+          trackUrl,
+          trackId,
+          title !== 'music-track' ? title : null
+        );
+        sourceBuffer = await downloadSoundCloudSourceBuffer(
+          fallbackResolved.streamUrl,
+          fallbackResolved.isHls
+        );
+      }
 
+      const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
       responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
       return new NextResponse(new Uint8Array(convertedBuffer), {
         headers: responseHeaders,
@@ -188,7 +207,7 @@ export async function GET(request: NextRequest) {
     // ── SoundCloud Download Path ──
     const resolved = await resolveStreamInfo(trackUrl, trackId);
 
-    // Direct zero-FFmpeg fast path when user requests standard 128kbps MP3 and source is already 128kbps MP3
+    // Direct zero-FFmpeg fast path when user requests standard 128kbps MP3 and source is already real MP3
     if (format === 'mp3-128' && resolved.isMp3) {
       if (!resolved.isHls) {
         const upstream = await fetch(resolved.streamUrl, {
@@ -241,25 +260,14 @@ export async function GET(request: NextRequest) {
       return new NextResponse(stream, { headers: responseHeaders });
     }
 
-    // For MP3-320, MP3-256, FLAC, WAV: parallel download in Node, then fast local FFmpeg conversion
+    // Download segments in parallel in Node, then convert locally with FFmpeg to requested bitrate/format
     const sourceBuffer = await downloadSoundCloudSourceBuffer(resolved.streamUrl, resolved.isHls);
-    try {
-      const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
-      responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
-      return new NextResponse(new Uint8Array(convertedBuffer), {
-        headers: responseHeaders,
-      });
-    } catch (ffmpegErr) {
-      // If MP3 conversion failed on serverless, fallback to native MP3 buffer so download still succeeds
-      if (config.ext === 'mp3' && resolved.isMp3) {
-        console.warn('FFmpeg fallback to native MP3 buffer:', ffmpegErr);
-        responseHeaders['Content-Length'] = String(sourceBuffer.byteLength);
-        return new NextResponse(new Uint8Array(sourceBuffer), {
-          headers: responseHeaders,
-        });
-      }
-      throw ffmpegErr;
-    }
+    const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
+
+    responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
+    return new NextResponse(new Uint8Array(convertedBuffer), {
+      headers: responseHeaders,
+    });
   } catch (err: unknown) {
     console.error('Download error:', err);
     const message = err instanceof Error ? err.message : 'Server error';
