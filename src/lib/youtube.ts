@@ -188,6 +188,7 @@ export async function fetchYouTubeTitle(videoId: string): Promise<string | null>
     return cached.title;
   }
 
+  // 1. Try oEmbed first (fast)
   try {
     const u = new URL('https://www.youtube.com/oembed');
     u.searchParams.set('url', `https://www.youtube.com/watch?v=${videoId}`);
@@ -196,18 +197,86 @@ export async function fetchYouTubeTitle(videoId: string): Promise<string | null>
       headers: { 'User-Agent': WEB_USER_AGENT },
       cache: 'no-store',
     });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { title?: string; author_name?: string };
-    if (!data?.title) return null;
-    const cleanAuthor = (data.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
-    const full = cleanAuthor && !data.title.toLowerCase().includes(cleanAuthor.toLowerCase())
-      ? `${cleanAuthor} - ${data.title}`
-      : data.title;
-    g.ytMetaCache?.set(videoId, { title: full, expiresAt: Date.now() + META_CACHE_TTL_MS });
-    return full;
+    if (res.ok) {
+      const data = (await res.json()) as { title?: string; author_name?: string };
+      if (data?.title) {
+        const cleanAuthor = (data.author_name || '').replace(/\s*-\s*Topic$/i, '').trim();
+        const full = cleanAuthor ? `${cleanAuthor} - ${data.title}` : data.title;
+        g.ytMetaCache?.set(videoId, { title: full, expiresAt: Date.now() + META_CACHE_TTL_MS });
+        return full;
+      }
+    }
   } catch {
-    return null;
+    // Fall through to InnerTube search
   }
+
+  // 2. Fallback to InnerTube search by videoId (works even when embedding is disabled)
+  try {
+    const results = await searchYouTubeTracks(videoId, 1);
+    if (results.length > 0) {
+      const full = `${results[0].artist} - ${results[0].title}`;
+      g.ytMetaCache?.set(videoId, { title: full, expiresAt: Date.now() + META_CACHE_TTL_MS });
+      return full;
+    }
+  } catch {
+    // Ignore
+  }
+
+  return null;
+}
+
+export function buildCandidateQueries(rawInput: string): string[] {
+  const raw = (rawInput || '').trim();
+  if (!raw) return [];
+
+  const stripBracketsAndNoise = (s: string) =>
+    s
+      .replace(/\([^)]*\)/g, ' ')
+      .replace(/\[[^\]]*\]/g, ' ')
+      .replace(/\{[^}]*\}/g, ' ')
+      .replace(/#[^\s]+/g, ' ')
+      .replace(
+        /\b(official|music|video|audio|lyric|lyrics|visualizer|full|song|songs|new|sinhala|hindi|tamil|english|hd|hq|4k|8k|mv|feat|ft|with|prod|by|topic|vevo|records|entertainment|entertainments|creations|studio|studios|channel|subscribe|version|live|performance|ost|soundtrack)\b/gi,
+        ' '
+      )
+      .replace(/\b(19|20)\d{2}\b/g, ' ')
+      .replace(/[|•·~—–_/\\:+*!?,"'`&]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const dedupeWords = (s: string) => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const w of s.split(/\s+/)) {
+      const k = w.toLowerCase();
+      if (k.length < 2 && !/^\d+$/.test(k)) continue;
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(w);
+      }
+    }
+    return out.join(' ');
+  };
+
+  const asciiOnly = (s: string) =>
+    dedupeWords(s.replace(/[^\x20-\x7E]/g, ' ').replace(/-/g, ' '));
+
+  // If rawInput is "Channel - Video Title", extract the video title without the channel prefix
+  const dashParts = raw.split(/\s+-\s+/);
+  const withoutChannelPrefix = dashParts.length >= 2 ? dashParts.slice(1).join(' - ') : raw;
+  const firstPipeSegment = withoutChannelPrefix.split('|')[0].trim();
+  const firstTrackSegment = firstPipeSegment.split(/\s+-\s+/)[0].trim();
+
+  const cand1 = asciiOnly(stripBracketsAndNoise(firstPipeSegment));
+  const cand2 = asciiOnly(stripBracketsAndNoise(raw)).split(/\s+/).slice(0, 5).join(' ');
+  const cand3 = asciiOnly(stripBracketsAndNoise(firstTrackSegment));
+  const cand4 = cand1.split(/\s+/).slice(0, 2).join(' ');
+  const cand5 = cand2.split(/\s+/).slice(0, 2).join(' ');
+  const cand6 = dedupeWords(stripBracketsAndNoise(firstPipeSegment).replace(/-/g, ' '));
+  const cand7 = cand1.split(/\s+/)[0] || '';
+
+  const all = [cand1, cand2, cand3, cand4, cand5, cand6, cand7];
+  return [...new Set(all.map((c) => c.trim()).filter((c) => c.length >= 2))];
 }
 
 interface InnerTubeFormat {
@@ -246,7 +315,6 @@ async function tryInnerTubeClient(
   }
 ): Promise<ResolvedYouTubeStream | null> {
   try {
-    // Do NOT send Origin or mismatched X-YouTube-Client-Name headers for native IOS/Android clients
     const res = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
       method: 'POST',
       headers: {
@@ -324,7 +392,7 @@ export async function resolveYouTubeStream(
     return cached.resolved;
   }
 
-  // 1. Try IOS InnerTube client (works directly without signature deciphering)
+  // 1. Try IOS InnerTube client
   let resolved = await tryInnerTubeClient(videoId, {
     clientName: 'IOS',
     clientVersion: '20.03.02',
@@ -369,7 +437,8 @@ export async function resolveYouTubeStream(
 }
 
 /**
- * Resolves a matching SoundCloud CDN stream when YouTube blocks datacenter IPs (e.g. on Vercel).
+ * Resolves a matching SoundCloud CDN stream using multi-stage query progressive simplification
+ * when YouTube blocks datacenter IPs (e.g. on Vercel).
  */
 export async function resolveYouTubeFallbackViaSoundCloud(
   trackUrl?: string | null,
@@ -380,32 +449,32 @@ export async function resolveYouTubeFallbackViaSoundCloud(
     (trackId && extractYouTubeId(trackId)) ||
     (trackUrl && extractYouTubeId(trackUrl));
 
-  let searchQuery = fallbackTitle?.trim() || '';
-  if (!searchQuery && videoId) {
-    searchQuery = (await fetchYouTubeTitle(videoId)) || '';
+  let rawTitle = fallbackTitle?.trim() || '';
+  if (!rawTitle && videoId) {
+    rawTitle = (await fetchYouTubeTitle(videoId)) || '';
   }
 
-  // Clean common YouTube title noise like "(Official Video)", "[Lyrics]", etc.
-  const cleanedQuery = searchQuery
-    .replace(/\(official\s*(music\s*)?video\)/gi, '')
-    .replace(/\[official\s*(music\s*)?video\]/gi, '')
-    .replace(/\(official\s*audio\)/gi, '')
-    .replace(/\(lyrics?\s*(video)?\)/gi, '')
-    .replace(/\[lyrics?\s*(video)?\]/gi, '')
-    .replace(/\b(4K|HD|HQ)\b/gi, '')
-    .trim();
-
-  const queryToUse = cleanedQuery || searchQuery;
-  if (!queryToUse) {
-    throw new Error('Could not resolve YouTube audio stream for this video');
+  const candidateQueries = buildCandidateQueries(rawTitle);
+  if (videoId && candidateQueries.length === 0) {
+    candidateQueries.push(videoId);
   }
 
-  const scTracks = await searchSoundCloudTracks(queryToUse, 5);
-  if (!scTracks.length) {
-    throw new Error('Could not resolve YouTube audio stream for this video');
+  for (const query of candidateQueries) {
+    try {
+      const scTracks = await searchSoundCloudTracks(query, 5);
+      for (const scTrack of scTracks) {
+        try {
+          return await resolveStreamInfo(scTrack.permalink_url, String(scTrack.id));
+        } catch {
+          // Try next track in search results
+        }
+      }
+    } catch {
+      // Try next simplified candidate query
+    }
   }
 
-  return await resolveStreamInfo(scTracks[0].permalink_url, String(scTracks[0].id));
+  throw new Error('Could not resolve YouTube audio stream for this video');
 }
 
 export async function downloadYouTubeAudioBuffer(resolved: ResolvedYouTubeStream): Promise<Buffer> {
