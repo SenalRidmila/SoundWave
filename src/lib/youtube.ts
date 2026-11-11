@@ -20,11 +20,13 @@ export interface ResolvedYouTubeStream {
 
 interface GlobalYTCache {
   ytStreamCache?: Map<string, { resolved: ResolvedYouTubeStream; expiresAt: number }>;
+  ytFallbackCache?: Map<string, { resolved: ResolvedStream; expiresAt: number }>;
   ytMetaCache?: Map<string, { title: string; expiresAt: number }>;
 }
 
 const g = globalThis as unknown as GlobalYTCache;
 if (!g.ytStreamCache) g.ytStreamCache = new Map();
+if (!g.ytFallbackCache) g.ytFallbackCache = new Map();
 if (!g.ytMetaCache) g.ytMetaCache = new Map();
 
 const STREAM_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -107,6 +109,7 @@ export async function searchYouTubeTracks(query: string, limit = 20): Promise<So
       query,
     }),
     cache: 'no-store',
+    signal: AbortSignal.timeout(8000),
   });
 
   if (!res.ok) {
@@ -196,6 +199,7 @@ export async function fetchYouTubeTitle(videoId: string): Promise<string | null>
     const res = await fetch(u.toString(), {
       headers: { 'User-Agent': WEB_USER_AGENT },
       cache: 'no-store',
+      signal: AbortSignal.timeout(5000),
     });
     if (res.ok) {
       const data = (await res.json()) as { title?: string; author_name?: string };
@@ -449,12 +453,21 @@ export async function resolveYouTubeFallbackViaSoundCloud(
     (trackId && extractYouTubeId(trackId)) ||
     (trackUrl && extractYouTubeId(trackUrl));
 
+  const cacheKey = videoId || (fallbackTitle ? fallbackTitle.trim().toLowerCase() : '');
+  const now = Date.now();
+  if (cacheKey && g.ytFallbackCache) {
+    const cached = g.ytFallbackCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+      return cached.resolved;
+    }
+  }
+
   let rawTitle = fallbackTitle?.trim() || '';
   if (!rawTitle && videoId) {
     rawTitle = (await fetchYouTubeTitle(videoId)) || '';
   }
 
-  const candidateQueries = buildCandidateQueries(rawTitle);
+  const candidateQueries = buildCandidateQueries(rawTitle).slice(0, 5);
   if (videoId && candidateQueries.length === 0) {
     candidateQueries.push(videoId);
   }
@@ -464,7 +477,15 @@ export async function resolveYouTubeFallbackViaSoundCloud(
       const scTracks = await searchSoundCloudTracks(query, 5);
       for (const scTrack of scTracks) {
         try {
-          return await resolveStreamInfo(scTrack.permalink_url, String(scTrack.id));
+          const resolved = await resolveStreamInfo(scTrack.permalink_url, String(scTrack.id));
+          if (cacheKey && g.ytFallbackCache) {
+            if (g.ytFallbackCache.size > 300) g.ytFallbackCache.clear();
+            g.ytFallbackCache.set(cacheKey, {
+              resolved,
+              expiresAt: Date.now() + STREAM_CACHE_TTL_MS,
+            });
+          }
+          return resolved;
         } catch {
           // Try next track in search results
         }

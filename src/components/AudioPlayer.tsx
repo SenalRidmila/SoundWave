@@ -20,6 +20,7 @@ export default function AudioPlayer() {
   const progressRef = useRef<HTMLDivElement>(null);
   const hlsRef = useRef<Hls | null>(null);
   const fallbackAttemptedRef = useRef<boolean>(false);
+  const isSwitchingRef = useRef<boolean>(false);
 
   const destroyHls = useCallback(() => {
     if (hlsRef.current) {
@@ -40,6 +41,7 @@ export default function AudioPlayer() {
       return;
     }
     fallbackAttemptedRef.current = true;
+    isSwitchingRef.current = false;
     destroyHls();
 
     const params = new URLSearchParams({
@@ -66,7 +68,13 @@ export default function AudioPlayer() {
 
     let cancelled = false;
     fallbackAttemptedRef.current = false;
+    isSwitchingRef.current = true;
     const songSource = currentSong.source || 'soundcloud';
+
+    if (currentSong.durationSeconds && currentSong.durationSeconds > 0) {
+      setDuration(currentSong.durationSeconds);
+    }
+    setCurrentTime(0);
 
     const loadStream = async () => {
       setLoading(true);
@@ -74,8 +82,7 @@ export default function AudioPlayer() {
 
       if (audioRef.current) {
         audioRef.current.pause();
-        audioRef.current.removeAttribute('src');
-        audioRef.current.load();
+        audioRef.current.currentTime = 0;
       }
 
       const fullTitle = `${currentSong.artist} - ${currentSong.title}`;
@@ -96,6 +103,13 @@ export default function AudioPlayer() {
           return;
         }
 
+        if (typeof data.durationSeconds === 'number' && data.durationSeconds > 0) {
+          const existingDur = usePlayerStore.getState().duration;
+          if (!existingDur || existingDur <= 0) {
+            setDuration(data.durationSeconds);
+          }
+        }
+
         const isHls = Boolean(data.isHls || data.streamUrl.includes('.m3u8'));
 
         if (isHls && Hls.isSupported()) {
@@ -109,9 +123,18 @@ export default function AudioPlayer() {
 
           hls.on(Hls.Events.MANIFEST_PARSED, () => {
             if (cancelled) return;
+            isSwitchingRef.current = false;
             setLoading(false);
             if (usePlayerStore.getState().isPlaying) {
               audioRef.current?.play().catch(() => {});
+            }
+          });
+
+          hls.on(Hls.Events.LEVEL_LOADED, (_event, levelData) => {
+            if (cancelled) return;
+            const totalDur = levelData?.details?.totalduration;
+            if (typeof totalDur === 'number' && Number.isFinite(totalDur) && totalDur > 1) {
+              setDuration(totalDur);
             }
           });
 
@@ -125,6 +148,7 @@ export default function AudioPlayer() {
         } else {
           audioRef.current.src = data.streamUrl;
           audioRef.current.load();
+          isSwitchingRef.current = false;
           setLoading(false);
           if (usePlayerStore.getState().isPlaying) {
             audioRef.current.play().catch(() => {});
@@ -143,7 +167,7 @@ export default function AudioPlayer() {
     return () => {
       cancelled = true;
     };
-  }, [currentSong?.id, currentSong?.url, currentSong?.source, destroyHls, playDirectFallback, setLoading]);
+  }, [currentSong?.id, currentSong?.url, currentSong?.source, currentSong?.durationSeconds, destroyHls, playDirectFallback, setCurrentTime, setDuration, setLoading]);
 
   // Handle play/pause toggle from UI
   useEffect(() => {
@@ -167,14 +191,42 @@ export default function AudioPlayer() {
     audioRef.current.volume = isMuted ? 0 : volume;
   }, [volume, isMuted]);
 
+  // Active polling timer while playing so currentTime and duration always update smoothly
+  useEffect(() => {
+    if (!currentSong) return;
+    const timer = setInterval(() => {
+      const audio = audioRef.current;
+      if (!audio) return;
+      if (!audio.paused && Number.isFinite(audio.currentTime)) {
+        setCurrentTime(audio.currentTime);
+      }
+      const d = audio.duration;
+      if (Number.isFinite(d) && d > 1) {
+        const storeDur = usePlayerStore.getState().duration;
+        if (!storeDur || Math.abs(storeDur - d) > 2) {
+          setDuration(d);
+        }
+      }
+    }, 250);
+    return () => clearInterval(timer);
+  }, [currentSong, isPlaying, setCurrentTime, setDuration]);
+
   const handleTimeUpdate = useCallback(() => {
-    if (audioRef.current) setCurrentTime(audioRef.current.currentTime);
-  }, [setCurrentTime]);
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (Number.isFinite(audio.currentTime)) {
+      setCurrentTime(audio.currentTime);
+    }
+    const d = audio.duration;
+    if (Number.isFinite(d) && d > 1 && usePlayerStore.getState().duration <= 0) {
+      setDuration(d);
+    }
+  }, [setCurrentTime, setDuration]);
 
   const handleLoadedMetadata = useCallback(() => {
     if (audioRef.current) {
       const d = audioRef.current.duration;
-      if (Number.isFinite(d) && d > 0) {
+      if (Number.isFinite(d) && d > 1) {
         setDuration(d);
       }
       setLoading(false);
@@ -185,6 +237,7 @@ export default function AudioPlayer() {
   }, [setDuration, setLoading]);
 
   const handleAudioError = useCallback(() => {
+    if (isSwitchingRef.current) return;
     if (currentSong && !fallbackAttemptedRef.current) {
       playDirectFallback(
         currentSong.url,
@@ -197,11 +250,18 @@ export default function AudioPlayer() {
     }
   }, [currentSong, playDirectFallback, setLoading]);
 
+  const effectiveDuration =
+    duration > 0
+      ? duration
+      : currentSong?.durationSeconds && currentSong.durationSeconds > 0
+      ? currentSong.durationSeconds
+      : 0;
+
   const handleProgressClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!progressRef.current || !audioRef.current || duration <= 0) return;
+    if (!progressRef.current || !audioRef.current || effectiveDuration <= 0) return;
     const rect = progressRef.current.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const newTime = ratio * duration;
+    const newTime = ratio * effectiveDuration;
     audioRef.current.currentTime = newTime;
     setCurrentTime(newTime);
   };
@@ -213,7 +273,8 @@ export default function AudioPlayer() {
     return `${m}:${String(sec).padStart(2, '0')}`;
   };
 
-  const progressPercent = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
+  const progressPercent =
+    effectiveDuration > 0 ? Math.min(100, (currentTime / effectiveDuration) * 100) : 0;
   const isYT = currentSong?.source === 'youtube';
 
   return (
@@ -222,6 +283,7 @@ export default function AudioPlayer() {
         ref={audioRef}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
+        onDurationChange={handleLoadedMetadata}
         onEnded={playNext}
         onPlay={() => setIsPlaying(true)}
         onPause={() => {
@@ -239,32 +301,49 @@ export default function AudioPlayer() {
       {currentSong && (
         <div className="fixed bottom-0 left-0 right-0 z-50 sw-slide-up-panel">
           {/* Blur backdrop */}
-          <div className="absolute inset-0 bg-gray-950/90 backdrop-blur-2xl border-t border-white/10" />
+          <div className="absolute inset-0 bg-gray-950/95 backdrop-blur-2xl border-t border-white/10" />
 
-          {/* Progress bar (top) — taller hit area on touch screens */}
-          <div
-            ref={progressRef}
-            onClick={handleProgressClick}
-            className="relative h-2 sm:h-1.5 cursor-pointer group"
-            aria-label="Seek"
-            id="player-seekbar"
-          >
-            <div className="absolute inset-0 bg-white/10" />
-            <div
-              className={`absolute top-0 left-0 h-full transition-all duration-100 ${
-                isYT
-                  ? 'bg-gradient-to-r from-red-600 to-rose-500'
-                  : 'bg-gradient-to-r from-orange-500 to-red-500'
+          {/* Interactive Seek Bar + Live Playing Time Row (Visible on Mobile, Tablet & Desktop) */}
+          <div className="relative max-w-7xl mx-auto px-3 sm:px-6 pt-2 pb-0.5 flex items-center gap-2.5 sm:gap-3">
+            <span
+              className={`text-[11px] sm:text-xs font-mono font-semibold tabular-nums min-w-[34px] text-right ${
+                isYT ? 'text-red-400' : 'text-orange-400'
               }`}
-              style={{ width: `${progressPercent}%` }}
-            />
+              id="player-current-time"
+            >
+              {formatTime(currentTime)}
+            </span>
+
             <div
-              className="absolute top-1/2 -translate-y-1/2 w-3.5 h-3.5 bg-white rounded-full shadow-lg opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity"
-              style={{ left: `${progressPercent}%`, transform: 'translateX(-50%) translateY(-50%)' }}
-            />
+              ref={progressRef}
+              onClick={handleProgressClick}
+              className="relative flex-1 h-2 sm:h-2 bg-white/15 rounded-full cursor-pointer group flex items-center"
+              aria-label="Seek"
+              id="player-seekbar"
+            >
+              <div
+                className={`h-full rounded-full transition-all duration-150 ${
+                  isYT
+                    ? 'bg-gradient-to-r from-red-600 to-rose-500'
+                    : 'bg-gradient-to-r from-orange-500 to-red-500'
+                }`}
+                style={{ width: `${progressPercent}%` }}
+              />
+              <div
+                className="absolute top-1/2 -translate-y-1/2 w-3.5 h-3.5 bg-white rounded-full shadow-lg transition-transform group-hover:scale-125"
+                style={{ left: `${progressPercent}%`, transform: 'translateX(-50%) translateY(-50%)' }}
+              />
+            </div>
+
+            <span
+              className="text-[11px] sm:text-xs font-mono font-medium text-gray-300 tabular-nums min-w-[34px]"
+              id="player-total-duration"
+            >
+              {formatTime(effectiveDuration)}
+            </span>
           </div>
 
-          <div className="relative max-w-7xl mx-auto px-3 sm:px-6 py-2.5 sm:py-3 flex items-center justify-between gap-2 sm:gap-4">
+          <div className="relative max-w-7xl mx-auto px-3 sm:px-6 py-2 sm:py-2.5 flex items-center justify-between gap-2 sm:gap-4">
             {/* Song info (flexible on mobile, fixed width on tablet/desktop) */}
             <div className="flex items-center gap-2.5 sm:gap-3 flex-1 sm:flex-initial sm:w-52 md:w-64 min-w-0">
               <div className="relative w-10 h-10 sm:w-12 sm:h-12 rounded-lg overflow-hidden flex-shrink-0 shadow-lg bg-gray-800">
@@ -293,10 +372,6 @@ export default function AudioPlayer() {
                   <p className="text-white text-xs sm:text-sm font-medium truncate">{currentSong.title}</p>
                 </div>
                 <p className="text-gray-400 text-[11px] sm:text-xs truncate">{currentSong.artist}</p>
-                {/* Mobile time readout */}
-                <p className="text-gray-500 text-[10px] font-mono sm:hidden mt-0.5">
-                  {formatTime(currentTime)} / {formatTime(duration)}
-                </p>
               </div>
             </div>
 
@@ -346,13 +421,6 @@ export default function AudioPlayer() {
                 <button type="button" className="text-gray-400 hover:text-white transition-colors p-1 hidden lg:block" aria-label="Repeat" id="player-repeat">
                   <Repeat className="w-4 h-4" />
                 </button>
-              </div>
-
-              {/* Time (Tablet & Desktop) */}
-              <div className="hidden sm:flex items-center gap-2 text-xs text-gray-400 font-mono">
-                <span>{formatTime(currentTime)}</span>
-                <span className="text-gray-600">/</span>
-                <span>{formatTime(duration)}</span>
               </div>
             </div>
 

@@ -46,6 +46,7 @@ export interface ResolvedStream {
   mimeType: string;
   isHls: boolean;
   isMp3: boolean;
+  durationSeconds?: number;
 }
 
 interface GlobalSCCache {
@@ -135,6 +136,7 @@ async function scrapeClientId(): Promise<string> {
       Accept: 'text/html,application/xhtml+xml',
     },
     cache: 'no-store',
+    signal: AbortSignal.timeout(8000),
   });
 
   if (!res.ok) {
@@ -164,6 +166,7 @@ async function scrapeClientId(): Promise<string> {
           const r = await fetch(url, {
             headers: { 'User-Agent': USER_AGENT },
             cache: 'no-store',
+            signal: AbortSignal.timeout(6000),
           });
           return r.ok ? await r.text() : '';
         } catch {
@@ -212,6 +215,7 @@ async function scApiFetch<T>(buildUrl: (clientId: string) => string): Promise<T>
   let res = await fetch(buildUrl(clientId), {
     headers: DEFAULT_HEADERS,
     cache: 'no-store',
+    signal: AbortSignal.timeout(8000),
   });
 
   if (res.status === 401 || res.status === 403) {
@@ -219,6 +223,7 @@ async function scApiFetch<T>(buildUrl: (clientId: string) => string): Promise<T>
     res = await fetch(buildUrl(clientId), {
       headers: DEFAULT_HEADERS,
       cache: 'no-store',
+      signal: AbortSignal.timeout(8000),
     });
   }
 
@@ -368,12 +373,15 @@ async function tryResolveFromTrack(info: SCTrack): Promise<ResolvedStream | null
         const mimeType = candidate.format?.mime_type || 'audio/mp4';
         const isHls = candidate.format?.protocol === 'hls' || data.url.includes('.m3u8');
         const isMp3 = isRealMp3Mime(mimeType);
+        const rawDurationMs = info.duration || info.full_duration || candidate.duration || 0;
+        const durationSeconds = rawDurationMs > 0 ? Math.round(rawDurationMs / 1000) : undefined;
         return {
           streamUrl: data.url,
           protocol: isHls ? 'hls' : 'progressive',
           mimeType,
           isHls,
           isMp3,
+          durationSeconds,
         };
       }
     } catch {
@@ -422,6 +430,7 @@ export async function getHlsSegmentUrls(m3u8Url: string): Promise<string[]> {
   const res = await fetch(m3u8Url, {
     headers: { 'User-Agent': USER_AGENT },
     cache: 'no-store',
+    signal: AbortSignal.timeout(8000),
   });
 
   if (!res.ok) {

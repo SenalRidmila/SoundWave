@@ -5,9 +5,7 @@ import os from 'os';
 import path from 'path';
 import { resolveStreamInfo, getHlsSegmentUrls } from '@/lib/soundcloud';
 import {
-  resolveYouTubeStream,
   resolveYouTubeFallbackViaSoundCloud,
-  downloadYouTubeAudioBuffer,
   isYouTubeUrl,
 } from '@/lib/youtube';
 
@@ -26,17 +24,17 @@ const FORMAT_CONFIGS: Record<AudioFormat, FormatConfig> = {
   'mp3-128': {
     ext: 'mp3',
     mimeType: 'audio/mpeg',
-    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-compression_level', '7', '-f', 'mp3'],
+    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '128k', '-compression_level', '9', '-f', 'mp3'],
   },
   'mp3-256': {
     ext: 'mp3',
     mimeType: 'audio/mpeg',
-    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '256k', '-compression_level', '7', '-f', 'mp3'],
+    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '256k', '-compression_level', '9', '-f', 'mp3'],
   },
   'mp3-320': {
     ext: 'mp3',
     mimeType: 'audio/mpeg',
-    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '320k', '-compression_level', '7', '-f', 'mp3'],
+    ffmpegArgs: ['-vn', '-c:a', 'libmp3lame', '-b:a', '320k', '-compression_level', '9', '-f', 'mp3'],
   },
   'flac': {
     ext: 'flac',
@@ -64,6 +62,7 @@ async function fetchBufferWithRetry(url: string, retries = 2): Promise<Uint8Arra
       const res = await fetch(url, {
         headers: { 'User-Agent': USER_AGENT },
         cache: 'no-store',
+        signal: AbortSignal.timeout(6000),
       });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
@@ -85,7 +84,7 @@ async function downloadSoundCloudSourceBuffer(streamUrl: string, isHls: boolean)
 
   const segmentUrls = await getHlsSegmentUrls(streamUrl);
   const chunks: Buffer[] = new Array(segmentUrls.length);
-  const batchSize = 12;
+  const batchSize = 24;
 
   for (let i = 0; i < segmentUrls.length; i += batchSize) {
     const batch = segmentUrls.slice(i, i + batchSize);
@@ -98,7 +97,10 @@ async function downloadSoundCloudSourceBuffer(streamUrl: string, isHls: boolean)
   return Buffer.concat(chunks);
 }
 
-async function convertWithFfmpeg(inputBuffer: Buffer, config: FormatConfig): Promise<Buffer> {
+async function createFfmpegReadableStream(
+  inputBuffer: Buffer,
+  config: FormatConfig
+): Promise<ReadableStream<Uint8Array>> {
   const ffmpegInstaller = (await import('@ffmpeg-installer/ffmpeg')).default;
   const ffmpegBin = ffmpegInstaller.path;
 
@@ -111,41 +113,74 @@ async function convertWithFfmpeg(inputBuffer: Buffer, config: FormatConfig): Pro
   const tmpDir = os.tmpdir();
   const uid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const inputPath = path.join(tmpDir, `sw-in-${uid}.tmp`);
-  const outputPath = path.join(tmpDir, `sw-out-${uid}.${config.ext}`);
 
-  try {
-    await fs.promises.writeFile(inputPath, inputBuffer);
+  await fs.promises.writeFile(inputPath, inputBuffer);
 
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn(ffmpegBin, [
+  let proc: ReturnType<typeof spawn> | null = null;
+  let cleanedUp = false;
+
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    fs.promises.unlink(inputPath).catch(() => {});
+  };
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      let closed = false;
+      let stderr = '';
+
+      proc = spawn(ffmpegBin, [
         '-nostdin',
-        '-y',
+        '-hide_banner',
+        '-loglevel', 'error',
         '-threads', '2',
         '-i', inputPath,
         ...config.ffmpegArgs,
-        outputPath,
+        'pipe:1',
       ]);
 
-      let stderr = '';
-      proc.stderr.on('data', (d) => {
-        stderr += d.toString();
-      });
-      proc.on('error', reject);
-      proc.on('close', (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          const detail = stderr.trim().split('\n').pop() || `exit code ${code}`;
-          reject(new Error(`FFmpeg conversion failed: ${detail}`));
+      proc.stdout?.on('data', (chunk: Buffer) => {
+        if (!closed) {
+          controller.enqueue(new Uint8Array(chunk));
         }
       });
-    });
 
-    return await fs.promises.readFile(outputPath);
-  } finally {
-    fs.promises.unlink(inputPath).catch(() => {});
-    fs.promises.unlink(outputPath).catch(() => {});
-  }
+      proc.stderr?.on('data', (d: Buffer) => {
+        stderr += d.toString();
+      });
+
+      proc.on('error', (err) => {
+        cleanup();
+        if (!closed) {
+          closed = true;
+          controller.error(err);
+        }
+      });
+
+      proc.on('close', (code) => {
+        cleanup();
+        if (closed) return;
+        closed = true;
+        if (code === 0) {
+          controller.close();
+        } else {
+          const detail = stderr.trim().split('\n').pop() || `exit code ${code}`;
+          controller.error(new Error(`FFmpeg conversion failed: ${detail}`));
+        }
+      });
+    },
+    cancel() {
+      if (proc && !proc.killed) {
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          // Ignore
+        }
+      }
+      cleanup();
+    },
+  });
 }
 
 export async function GET(request: NextRequest) {
@@ -178,34 +213,13 @@ export async function GET(request: NextRequest) {
     source === 'youtube' || (trackUrl ? isYouTubeUrl(trackUrl) : false);
 
   try {
-    // ── YouTube Download Path ──
-    if (isYouTube) {
-      let sourceBuffer: Buffer;
-      try {
-        const ytResolved = await resolveYouTubeStream(trackUrl, trackId);
-        sourceBuffer = await downloadYouTubeAudioBuffer(ytResolved);
-      } catch {
-        // Datacenter/Vercel IP fallback via SoundCloud CDN
-        const fallbackResolved = await resolveYouTubeFallbackViaSoundCloud(
+    const resolved = isYouTube
+      ? await resolveYouTubeFallbackViaSoundCloud(
           trackUrl,
           trackId,
           title !== 'music-track' ? title : null
-        );
-        sourceBuffer = await downloadSoundCloudSourceBuffer(
-          fallbackResolved.streamUrl,
-          fallbackResolved.isHls
-        );
-      }
-
-      const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
-      responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
-      return new NextResponse(new Uint8Array(convertedBuffer), {
-        headers: responseHeaders,
-      });
-    }
-
-    // ── SoundCloud Download Path ──
-    const resolved = await resolveStreamInfo(trackUrl, trackId);
+        )
+      : await resolveStreamInfo(trackUrl, trackId);
 
     // Direct zero-FFmpeg fast path when user requests standard 128kbps MP3 and source is already real MP3
     if (format === 'mp3-128' && resolved.isMp3) {
@@ -213,6 +227,7 @@ export async function GET(request: NextRequest) {
         const upstream = await fetch(resolved.streamUrl, {
           headers: { 'User-Agent': USER_AGENT },
           cache: 'no-store',
+          signal: AbortSignal.timeout(10000),
         });
 
         if (!upstream.ok || !upstream.body) {
@@ -233,7 +248,7 @@ export async function GET(request: NextRequest) {
       const stream = new ReadableStream<Uint8Array>({
         async start(controller) {
           try {
-            const batchSize = 12;
+            const batchSize = 24;
             for (let i = 0; i < segmentUrls.length; i += batchSize) {
               if (cancelled) break;
               const batch = segmentUrls.slice(i, i + batchSize);
@@ -260,12 +275,11 @@ export async function GET(request: NextRequest) {
       return new NextResponse(stream, { headers: responseHeaders });
     }
 
-    // Download segments in parallel in Node, then convert locally with FFmpeg to requested bitrate/format
+    // Download source segments in parallel, then stream FFmpeg output directly to the response
     const sourceBuffer = await downloadSoundCloudSourceBuffer(resolved.streamUrl, resolved.isHls);
-    const convertedBuffer = await convertWithFfmpeg(sourceBuffer, config);
+    const ffmpegStream = await createFfmpegReadableStream(sourceBuffer, config);
 
-    responseHeaders['Content-Length'] = String(convertedBuffer.byteLength);
-    return new NextResponse(new Uint8Array(convertedBuffer), {
+    return new NextResponse(ffmpegStream, {
       headers: responseHeaders,
     });
   } catch (err: unknown) {
